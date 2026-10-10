@@ -138,10 +138,8 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
           res_re <- tryCatch(
             metafor::rma.mv(yi = yi_go[valid_go], V = vi_go[valid_go], random = ~ 1 | valid_gse_go / valid_comp_go, method = "REML"),
             error = function(e) {
-              tryCatch(
-                metafor::rma.mv(yi = yi_go[valid_go], V = vi_go[valid_go], random = ~ 1 | valid_gse_go, method = "REML"),
-                error = function(e2) NULL
-              )
+              cat(sprintf("  - 3-level RE model failed for %s: %s\n", go_id, e$message))
+              NULL
             }
           )
           
