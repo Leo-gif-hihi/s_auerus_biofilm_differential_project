@@ -678,37 +678,65 @@ for (gse_id in unique_gses) {
   for (k in seq_along(comparisons)) {
     C_mat[, k] <- build_contrast("Group", comparisons[[k]]$comp, comparisons[[k]]$ref, res_names)
   }
-
+  out_vcov_dir <- file.path(out_dir, "deseq2_var_cov_results")
+  vcov_file <- file.path(out_vcov_dir, paste0(gse_id, "_variance_covariance.csv"))
+  
   cov_mats_gse <- list()
   valid_genes <- rownames(dds_gse)
-  for (i in seq_along(valid_genes)) {
-    gene_cov <- tryCatch(
-      {
-        V <- DESeq2:::covarianceMatrix(dds_gse, rowNumber = i)
-        t(C_mat) %*% V %*% C_mat
-      },
-      error = function(e) {
-        matrix(NA, nrow = ncol(C_mat), ncol = ncol(C_mat), dimnames = list(comp_names_gse, comp_names_gse))
+  
+  if (file.exists(vcov_file)) {
+    cat("  Found existing variance-covariance matrix file for", gse_id, ". Loading it...
+")
+    df_vcov <- read.csv(vcov_file, stringsAsFactors = FALSE)
+    for (i in seq_len(nrow(df_vcov))) {
+      gene <- as.character(df_vcov$cluster_id[i])
+      mat <- matrix(NA, nrow = length(comp_names_gse), ncol = length(comp_names_gse), dimnames = list(comp_names_gse, comp_names_gse))
+      for (k in seq_along(comp_names_gse)) {
+        comp_name <- comp_names_gse[k]
+        var_col <- paste0("var_", comp_name)
+        if (var_col %in% colnames(df_vcov)) mat[k, k] <- df_vcov[i, var_col]
+        if (k < length(comp_names_gse)) {
+          for (l in (k + 1):length(comp_names_gse)) {
+            comp_name2 <- comp_names_gse[l]
+            cov_col <- paste0("cov_", comp_name, "_", comp_name2)
+            if (cov_col %in% colnames(df_vcov)) {
+              mat[k, l] <- df_vcov[i, cov_col]
+              mat[l, k] <- df_vcov[i, cov_col]
+            }
+          }
+        }
       }
-    )
-    cov_mats_gse[[valid_genes[i]]] <- gene_cov
-  }
+      cov_mats_gse[[gene]] <- mat
+    }
+  } else {
+    for (i in seq_along(valid_genes)) {
+      gene_cov <- tryCatch(
+        {
+          V <- DESeq2:::covarianceMatrix(dds_gse, rowNumber = i)
+          t(C_mat) %*% V %*% C_mat
+        },
+        error = function(e) {
+          matrix(NA, nrow = ncol(C_mat), ncol = ncol(C_mat), dimnames = list(comp_names_gse, comp_names_gse))
+        }
+      )
+      cov_mats_gse[[valid_genes[i]]] <- gene_cov
+    }
 
-  df_vcov <- data.frame(cluster_id = valid_genes, stringsAsFactors = FALSE)
-  for (k in seq_along(comp_names_gse)) {
-    comp_name <- comp_names_gse[k]
-    df_vcov[[paste0("var_", comp_name)]] <- sapply(cov_mats_gse, function(x) x[k, k])
-    if (k < length(comp_names_gse)) {
-      for (l in (k + 1):length(comp_names_gse)) {
-        comp_name2 <- comp_names_gse[l]
-        df_vcov[[paste0("cov_", comp_name, "_", comp_name2)]] <- sapply(cov_mats_gse, function(x) x[k, l])
+    df_vcov <- data.frame(cluster_id = valid_genes, stringsAsFactors = FALSE)
+    for (k in seq_along(comp_names_gse)) {
+      comp_name <- comp_names_gse[k]
+      df_vcov[[paste0("var_", comp_name)]] <- sapply(cov_mats_gse, function(x) x[k, k])
+      if (k < length(comp_names_gse)) {
+        for (l in (k + 1):length(comp_names_gse)) {
+          comp_name2 <- comp_names_gse[l]
+          df_vcov[[paste0("cov_", comp_name, "_", comp_name2)]] <- sapply(cov_mats_gse, function(x) x[k, l])
+        }
       }
     }
-  }
 
-  out_vcov_dir <- file.path(out_dir, "deseq2_var_cov_results")
-  if (!dir.exists(out_vcov_dir)) dir.create(out_vcov_dir, recursive = TRUE)
-  write.csv(df_vcov, file.path(out_vcov_dir, paste0(gse_id, "_variance_covariance.csv")), row.names = FALSE)
+    if (!dir.exists(out_vcov_dir)) dir.create(out_vcov_dir, recursive = TRUE)
+    write.csv(df_vcov, vcov_file, row.names = FALSE)
+  }
 
   # --- Extract Z-Score Covariance (Correlation) Matrix for DESeq2 ---
   zcov_mats_gse <- list()
