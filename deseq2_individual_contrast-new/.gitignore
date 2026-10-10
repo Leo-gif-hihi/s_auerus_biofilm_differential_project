@@ -1,0 +1,28 @@
+# Ignore everything by default
+*
+
+# Allow directories so git can recurse into subfolders
+!*/
+
+# Whitelist .gitignore and docs
+!.gitignore
+!README.md
+!*.md
+
+# Whitelist Python scripts & notebooks
+!*.py
+!*.ipynb
+
+# Whitelist R scripts & markdown
+!*.R
+!*.r
+!*.Rmd
+!*.qmd
+
+# Prevent common Python/R cache/temp files from sneaking back in
+__pycache__/
+*.pyc
+.Rproj.user/
+.Rhistory
+.RData
+.RDataTmp
