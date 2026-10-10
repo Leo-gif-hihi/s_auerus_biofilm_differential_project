@@ -11,9 +11,13 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
       if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager", repos = "https://cloud.r-project.org")
       BiocManager::install("GO.db", update = FALSE, ask = FALSE)
     }
+    if (!requireNamespace("clubSandwich", quietly = TRUE)) {
+      install.packages("clubSandwich", repos = "https://cloud.r-project.org", quiet = TRUE)
+    }
     
     suppressPackageStartupMessages(library(clusterProfiler))
     suppressPackageStartupMessages(library(GO.db))
+    suppressPackageStartupMessages(library(clubSandwich))
     
     gaf <- read.delim(gaf_file, comment.char = "!", header = FALSE, stringsAsFactors = FALSE, quote="")
     term2gene <- unique(data.frame(term = gaf$V5, gene = gaf$V3, stringsAsFactors = FALSE))
@@ -142,6 +146,16 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
               NULL
             }
           )
+          
+          if (!is.null(res_re)) {
+            res_re <- tryCatch(
+              metafor::robust(res_re, cluster = valid_gse_go, clubSandwich = TRUE),
+              error = function(e) {
+                cat(sprintf("  - clubSandwich RVE failed for %s: %s\n", go_id, e$message))
+                NULL
+              }
+            )
+          }
           
           res_fe <- tryCatch(
             metafor::rma(yi = yi_go[valid_go], vi = vi_go[valid_go], method = "FE"),
