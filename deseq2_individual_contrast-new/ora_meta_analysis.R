@@ -66,18 +66,19 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
       de_mask <- dataset_padj < ora_padj & abs(lfcs[valid_mask]) >= ora_lfc
       de_clusters <- universe_clusters[de_mask]
       
-      if (length(de_clusters) == 0) {
-        cat("  - No DE genes for", comp_name, "- skipping ORA.\n")
-        next
-      }
-      
       universe_symbols <- unique(cluster_id_to_symbol[universe_clusters])
       universe_symbols <- universe_symbols[!is.na(universe_symbols) & universe_symbols != ""]
       
       de_symbols <- unique(cluster_id_to_symbol[de_clusters])
       de_symbols <- de_symbols[!is.na(de_symbols) & de_symbols != ""]
       
-      if (length(de_symbols) == 0) next
+      cat(sprintf("  [%s] Eligible genes: %d | Mapped universe genes: %d | Mapped DE genes for ORA: %d\n", 
+                  comp_name, length(universe_clusters), length(universe_symbols), length(de_symbols)))
+      
+      if (length(de_symbols) == 0) {
+        cat("  - Skipping ORA for", comp_name, "due to 0 mapped DE genes.\n")
+        next
+      }
       
       ora_res <- tryCatch({
         enricher(
