@@ -17,7 +17,7 @@ library(optparse)
 
 option_list <- list(
   make_option(c("-s", "--sample_dir"),
-    type = "character", default = "sample_info-biofilm-to-planktonic",
+    type = "character", default = "sample_info-biofilm-to-biofilm",
     help = "Directory containing sample info files [default= %default]", metavar = "character"
   ),
   make_option(c("-m", "--min_datasets"),
@@ -469,6 +469,7 @@ neff_list <- list()
 nt_list <- list()
 nc_list <- list()
 comparison_gse_map <- c() # To map comparison name to GSE ID/cluster for meta-analysis
+comparison_control_map <- c() # To map comparison name to specific control group
 
 dataset_dds_list <- list()
 
@@ -643,6 +644,7 @@ for (gse_id in unique_gses) {
     nt_list[[comparison_name]] <- n_t
     nc_list[[comparison_name]] <- n_c
     comparison_gse_map[comparison_name] <- gse_id
+    comparison_control_map[comparison_name] <- ref_group
   }
 
   # --- Extract Variance-Covariance Matrix for DESeq2 ---
@@ -1632,6 +1634,7 @@ run_ora_meta_analysis(
   cts = cts,
   cluster_annotation = cluster_annotation,
   comparison_gse_map = comparison_gse_map,
+  comparison_control_map = comparison_control_map,
   min_ds = min_ds,
   out_dir = out_dir,
   ora_padj = opt$ora_padj,

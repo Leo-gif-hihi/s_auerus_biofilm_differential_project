@@ -1,4 +1,4 @@
-run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_annotation, comparison_gse_map, min_ds, out_dir, ora_padj = 0.05, ora_lfc = 1.0) {
+run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_annotation, comparison_gse_map, comparison_control_map = NULL, min_ds, out_dir, ora_padj = 0.05, ora_lfc = 1.0) {
   cat("\n=== RUNNING OVER-REPRESENTATION META-ANALYSIS ===\n")
   if (!is.null(gaf_file) && file.exists(gaf_file)) {
     cat("Loading GAF file:", gaf_file, "\n")
@@ -46,6 +46,8 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
     
     ora_logor_list <- list()
     ora_se_list <- list()
+    ora_z_list <- list()
+    ora_z_se_list <- list()
     ora_comparisons <- c()
     ora_gse_map <- c()
     
@@ -119,8 +121,14 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
         logOR <- log((a_adj * d_adj) / (b_adj * c_adj))
         se_logOR <- sqrt(1/a_adj + 1/b_adj + 1/c_adj + 1/d_adj)
         
+        z_scores <- qnorm(res_df$pvalue, lower.tail = FALSE)
+        z_scores[is.infinite(z_scores)] <- 8.2 
+        se_z <- rep(1, length(z_scores))
+        
         ora_logor_list[[comp_name]] <- setNames(logOR, res_df$ID)
         ora_se_list[[comp_name]] <- setNames(se_logOR, res_df$ID)
+        ora_z_list[[comp_name]] <- setNames(z_scores, res_df$ID)
+        ora_z_se_list[[comp_name]] <- setNames(se_z, res_df$ID)
         ora_comparisons <- c(ora_comparisons, comp_name)
         ora_gse_map[comp_name] <- gse_id
       }
@@ -133,10 +141,14 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
       
       ora_yi <- matrix(NA, nrow = length(all_go_ids), ncol = length(ora_logor_list), dimnames = list(all_go_ids, ora_comparisons))
       ora_vi <- matrix(NA, nrow = length(all_go_ids), ncol = length(ora_se_list), dimnames = list(all_go_ids, ora_comparisons))
+      ora_z_yi <- matrix(NA, nrow = length(all_go_ids), ncol = length(ora_z_list), dimnames = list(all_go_ids, ora_comparisons))
+      ora_z_vi <- matrix(NA, nrow = length(all_go_ids), ncol = length(ora_z_se_list), dimnames = list(all_go_ids, ora_comparisons))
       
       for (comp_name in ora_comparisons) {
         ora_yi[names(ora_logor_list[[comp_name]]), comp_name] <- ora_logor_list[[comp_name]]
         ora_vi[names(ora_se_list[[comp_name]]), comp_name] <- ora_se_list[[comp_name]]^2
+        ora_z_yi[names(ora_z_list[[comp_name]]), comp_name] <- ora_z_list[[comp_name]]
+        ora_z_vi[names(ora_z_se_list[[comp_name]]), comp_name] <- ora_z_se_list[[comp_name]]^2
       }
       
       cat("  Meta-analyzing", length(all_go_ids), "GO terms across", length(ora_comparisons), "comparisons...\n")
@@ -146,6 +158,8 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
         go_id <- all_go_ids[i]
         yi_go <- ora_yi[i, ]
         vi_go <- ora_vi[i, ]
+        z_yi_go <- ora_z_yi[i, ]
+        z_vi_go <- ora_z_vi[i, ]
         
         # --- 6. Meta-Analyze Each GO Term ---
         # Fit 3-Level Random Effects (w/ clubSandwich RVE) and Fixed Effects models
@@ -154,10 +168,28 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
         valid_comp_go <- ora_comparisons[valid_go]
         
         if (length(unique(valid_gse_go)) >= max(2, min_ds)) {
+          
+          # Determine clustering for shared controls to assign rho = 0.5
+          if (!is.null(comparison_control_map)) {
+            valid_control_go <- comparison_control_map[valid_comp_go]
+            # Use GSE + Control as the cluster. If control is NA, it gets its own independent cluster
+            valid_cov_cluster <- paste0(valid_gse_go, "_", ifelse(is.na(valid_control_go), valid_comp_go, valid_control_go))
+          } else {
+            # If no map is provided, assume all comparisons are independent (rho = 0)
+            valid_cov_cluster <- valid_comp_go
+          }
+          
+          # Impute covariance (rho = 0.5) for comparisons sharing the same dataset/control
+          V_mat_logor <- tryCatch(
+            metafor::vcalc(vi = vi_go[valid_go], cluster = valid_cov_cluster, rho = 0.5),
+            error = function(e) vi_go[valid_go]
+          )
+          
+          # LogOR Meta-Analysis
           res_re <- tryCatch(
-            metafor::rma.mv(yi = yi_go[valid_go], V = vi_go[valid_go], random = ~ 1 | valid_gse_go / valid_comp_go, method = "REML"),
+            metafor::rma.mv(yi = yi_go[valid_go], V = V_mat_logor, random = ~ 1 | valid_gse_go / valid_comp_go, method = "REML"),
             error = function(e) {
-              cat(sprintf("  - 3-level RE model failed for %s: %s\n", go_id, e$message))
+              cat(sprintf("  - [logOR] 3-level RE model failed for %s: %s\n", go_id, e$message))
               NULL
             }
           )
@@ -166,28 +198,89 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
             res_re <- tryCatch(
               metafor::robust(res_re, cluster = valid_gse_go, clubSandwich = TRUE),
               error = function(e) {
-                cat(sprintf("  - clubSandwich RVE failed for %s: %s\n", go_id, e$message))
+                cat(sprintf("  - [logOR] clubSandwich RVE failed for %s: %s\n", go_id, e$message))
                 NULL
               }
             )
           }
           
           res_fe <- tryCatch(
-            metafor::rma(yi = yi_go[valid_go], vi = vi_go[valid_go], method = "FE"),
-            error = function(e) NULL
+            metafor::rma.mv(yi = yi_go[valid_go], V = V_mat_logor),
+            error = function(e) {
+              cat(sprintf("  - [logOR FE] model failed for %s: %s\n", go_id, e$message))
+              NULL
+            }
           )
           
-          if (!is.null(res_re) && !is.null(res_fe)) {
+          if (!is.null(res_fe)) {
+            res_fe <- tryCatch(
+              metafor::robust(res_fe, cluster = valid_gse_go, clubSandwich = TRUE),
+              error = function(e) {
+                cat(sprintf("  - [logOR FE] clubSandwich RVE failed for %s: %s\n", go_id, e$message))
+                NULL
+              }
+            )
+          }
+          
+          # Z-score Meta-Analysis
+          V_mat_z <- tryCatch(
+            metafor::vcalc(vi = z_vi_go[valid_go], cluster = valid_cov_cluster, rho = 0.5),
+            error = function(e) z_vi_go[valid_go]
+          )
+          
+          res_z_re <- tryCatch(
+            metafor::rma.mv(yi = z_yi_go[valid_go], V = V_mat_z, random = ~ 1 | valid_gse_go / valid_comp_go, method = "REML"),
+            error = function(e) {
+              cat(sprintf("  - [Z-score] 3-level RE model failed for %s: %s\n", go_id, e$message))
+              NULL
+            }
+          )
+          
+          if (!is.null(res_z_re)) {
+            res_z_re <- tryCatch(
+              metafor::robust(res_z_re, cluster = valid_gse_go, clubSandwich = TRUE),
+              error = function(e) {
+                cat(sprintf("  - [Z-score] clubSandwich RVE failed for %s: %s\n", go_id, e$message))
+                NULL
+              }
+            )
+          }
+          
+          res_z_fe <- tryCatch(
+            metafor::rma.mv(yi = z_yi_go[valid_go], V = V_mat_z),
+            error = function(e) {
+              cat(sprintf("  - [Z-score FE] model failed for %s: %s\n", go_id, e$message))
+              NULL
+            }
+          )
+          
+          if (!is.null(res_z_fe)) {
+            res_z_fe <- tryCatch(
+              metafor::robust(res_z_fe, cluster = valid_gse_go, clubSandwich = TRUE),
+              error = function(e) {
+                cat(sprintf("  - [Z-score FE] clubSandwich RVE failed for %s: %s\n", go_id, e$message))
+                NULL
+              }
+            )
+          }
+          
+          if (!is.null(res_re) && !is.null(res_fe) && !is.null(res_z_re) && !is.null(res_z_fe)) {
             ora_meta_res[[go_id]] <- data.frame(
               ID = go_id,
               Ontology = term2ontology$ontology[match(go_id, term2ontology$term)],
               Description = term2name$name[match(go_id, term2name$term)],
-              RE_logOR = res_re$beta[1],
-              RE_SE = res_re$se[1],
-              RE_pval = res_re$pval[1],
-              FE_logOR = res_fe$beta[1],
-              FE_SE = res_fe$se[1],
-              FE_pval = res_fe$pval[1],
+              logOR_RE_estimate = res_re$beta[1],
+              logOR_RE_SE = res_re$se[1],
+              logOR_RE_pval = res_re$pval[1],
+              logOR_FE_estimate = res_fe$beta[1],
+              logOR_FE_SE = res_fe$se[1],
+              logOR_FE_pval = res_fe$pval[1],
+              Z_RE_estimate = res_z_re$beta[1],
+              Z_RE_SE = res_z_re$se[1],
+              Z_RE_pval = res_z_re$pval[1],
+              Z_FE_estimate = res_z_fe$beta[1],
+              Z_FE_SE = res_z_fe$se[1],
+              Z_FE_pval = res_z_fe$pval[1],
               N_comparisons = sum(valid_go),
               N_datasets = length(unique(valid_gse_go)),
               stringsAsFactors = FALSE
@@ -202,16 +295,20 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
         ora_meta_df <- do.call(rbind, ora_meta_res)
         
         # Calculate FDR adjusted p-values for the meta-analysis results
-        ora_meta_df$RE_padj <- p.adjust(ora_meta_df$RE_pval, method = "BH")
-        ora_meta_df$FE_padj <- p.adjust(ora_meta_df$FE_pval, method = "BH")
+        ora_meta_df$logOR_RE_padj <- p.adjust(ora_meta_df$logOR_RE_pval, method = "BH")
+        ora_meta_df$logOR_FE_padj <- p.adjust(ora_meta_df$logOR_FE_pval, method = "BH")
+        ora_meta_df$Z_RE_padj <- p.adjust(ora_meta_df$Z_RE_pval, method = "BH")
+        ora_meta_df$Z_FE_padj <- p.adjust(ora_meta_df$Z_FE_pval, method = "BH")
         
         # Reorder columns to put padj next to pval
         ora_meta_df <- ora_meta_df[, c("ID", "Ontology", "Description", 
-                                       "RE_logOR", "RE_SE", "RE_pval", "RE_padj",
-                                       "FE_logOR", "FE_SE", "FE_pval", "FE_padj",
+                                       "logOR_RE_estimate", "logOR_RE_SE", "logOR_RE_pval", "logOR_RE_padj",
+                                       "logOR_FE_estimate", "logOR_FE_SE", "logOR_FE_pval", "logOR_FE_padj",
+                                       "Z_RE_estimate", "Z_RE_SE", "Z_RE_pval", "Z_RE_padj",
+                                       "Z_FE_estimate", "Z_FE_SE", "Z_FE_pval", "Z_FE_padj",
                                        "N_comparisons", "N_datasets")]
                                        
-        ora_meta_df <- ora_meta_df[order(ora_meta_df$RE_pval), ]
+        ora_meta_df <- ora_meta_df[order(ora_meta_df$logOR_RE_pval), ]
         write.csv(ora_meta_df, file.path(out_dir, "ORA_Meta_Analysis_Results.csv"), row.names = FALSE)
         cat("  - Saved ORA Meta-Analysis Results to", file.path(out_dir, "ORA_Meta_Analysis_Results.csv"), "\n")
       } else {
