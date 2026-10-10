@@ -199,6 +199,17 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
       # Combine all meta-analyzed GO terms, sort by Random-Effects p-value, and export to CSV
       if (length(ora_meta_res) > 0) {
         ora_meta_df <- do.call(rbind, ora_meta_res)
+        
+        # Calculate FDR adjusted p-values for the meta-analysis results
+        ora_meta_df$RE_padj <- p.adjust(ora_meta_df$RE_pval, method = "BH")
+        ora_meta_df$FE_padj <- p.adjust(ora_meta_df$FE_pval, method = "BH")
+        
+        # Reorder columns to put padj next to pval
+        ora_meta_df <- ora_meta_df[, c("ID", "Ontology", "Description", 
+                                       "RE_logOR", "RE_SE", "RE_pval", "RE_padj",
+                                       "FE_logOR", "FE_SE", "FE_pval", "FE_padj",
+                                       "N_comparisons", "N_datasets")]
+                                       
         ora_meta_df <- ora_meta_df[order(ora_meta_df$RE_pval), ]
         write.csv(ora_meta_df, file.path(out_dir, "ORA_Meta_Analysis_Results.csv"), row.names = FALSE)
         cat("  - Saved ORA Meta-Analysis Results to", file.path(out_dir, "ORA_Meta_Analysis_Results.csv"), "\n")
