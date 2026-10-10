@@ -1236,35 +1236,6 @@ meta_results <- lapply(seq_len(n_genes), function(i) {
       fe_pval <- NA
     }
 
-    ebm_pval <- NA
-    if (n_valid_datasets >= max(2, min_ds)) {
-      # Use lfc_matrix as data_matrix. Transpose so rows are comparisons, cols are genes.
-      # We subset t(lfc_matrix) to only the valid comparisons for this gene.
-      dat_matrix_for_ebm <- t(lfc_matrix[, valid, drop = FALSE])
-
-      # The empiricalBrownsMethod package fails if there are any NA values in the data matrix.
-      # We remove columns (genes) that have NAs across these specific valid comparisons.
-      dat_matrix_for_ebm <- dat_matrix_for_ebm[, colSums(is.na(dat_matrix_for_ebm)) == 0, drop = FALSE]
-
-      gene_pvals <- pval_matrix[i, valid]
-
-      if (ncol(dat_matrix_for_ebm) > 1) {
-        ebm_pval <- tryCatch(
-          {
-            EmpiricalBrownsMethod::empiricalBrownsMethod(
-              data_matrix = dat_matrix_for_ebm,
-              p_values = gene_pvals,
-              extra_info = FALSE
-            )
-          },
-          error = function(e) NA
-        )
-      } else {
-        ebm_pval <- NA # Not enough valid genes to compute correlation
-      }
-    } else if (n_valid_datasets == 1 && min_ds <= 1) {
-      ebm_pval <- pval_matrix[i, valid]
-    }
 
     # --- NEW: Stouffer's Meta-Analysis (Two-Sided & Direction-Aware) ---
     stouffer_z <- NA
@@ -1509,114 +1480,13 @@ meta_results <- lapply(seq_len(n_genes), function(i) {
       }
     }
 
-    # --- REVISED: Direction-Ignore LRE Model ---
-    glmm_lfc <- NA
-    glmm_se <- NA
-    glmm_pval <- NA
 
-    if (n_valid_datasets >= max(2, min_ds)) {
-      # 1. Take the absolute value instead of squaring
-      yi_abs <- abs(yi[valid])
-
-      # 2. Variance of absolute value is approximately equal to original variance
-      # for non-zero effects.
-      v_orig <- sei[valid]^2
-      weights_norm <- 1 / v_orig
-      weights_norm[!is.finite(weights_norm)] <- 1
-
-      glmm_data <- data.frame(
-        yi_abs = yi_abs,
-        valid_gse = valid_gse,
-        valid_comparison = valid_comparison,
-        weights_norm = weights_norm
-      )
-
-      res_glmm <- tryCatch(
-        suppressWarnings(
-          # 3. Use standard Gaussian, which handles weights correctly
-          # and doesn't crash on near-zero values
-          glmmTMB::glmmTMB(yi_abs ~ 1 + (1 | valid_gse),
-            weights = weights_norm,
-            family = gaussian(link = "identity"),
-            data = glmm_data
-          )
-        ),
-        error = function(e) NULL
-      )
-
-      if (!is.null(res_glmm) && isTRUE(res_glmm$sdr$pdHess)) {
-        summ <- tryCatch(summary(res_glmm), error = function(e) NULL)
-        if (!is.null(summ) && "cond" %in% names(summ$coefficients) && "(Intercept)" %in% rownames(summ$coefficients$cond)) {
-          # Estimate is now directly on the absolute LFC scale
-          est <- summ$coefficients$cond["(Intercept)", "Estimate"]
-          glmm_se <- summ$coefficients$cond["(Intercept)", "Std. Error"]
-
-          if (!is.na(glmm_se) && !is.nan(glmm_se) && glmm_se > 0) {
-            # Test whether the absolute LFC is significantly greater than the
-            # average noise (baseline standard error)
-            mean_noise <- mean(sqrt(v_orig))
-            z_val <- (est - mean_noise) / glmm_se
-
-            df <- length(unique(glmm_data$valid_gse)) - 1
-            if (df > 0) {
-              # One-tailed test: is the absolute magnitude greater than expected noise?
-              glmm_pval <- pt(z_val, df = df, lower.tail = FALSE)
-            } else {
-              glmm_pval <- NA
-            }
-
-            # Subtract baseline noise to correct the upward bias of absolute values
-            corrected_lfc <- est - mean_noise
-            glmm_lfc <- ifelse(corrected_lfc > 0, corrected_lfc, 0)
-          }
-        }
-      }
-
-      glmm_boot_pval <- glmm_pval
-      if (opt$use_pb && !is.na(glmm_pval) && glmm_pval < opt$pb_pval_thresh) {
-        tryCatch(
-          {
-            sims <- simulate(res_glmm, nsim = opt$pb_r)
-            boots_glmm <- numeric(opt$pb_r)
-            orig_stat <- z_val
-
-            for (b in seq_len(opt$pb_r)) {
-              res_boot <- tryCatch(update(res_glmm, sims[[b]] ~ .), error = function(e) NULL)
-              if (!is.null(res_boot)) {
-                summ_boot <- tryCatch(summary(res_boot), error = function(e) NULL)
-                if (!is.null(summ_boot) && "cond" %in% names(summ_boot$coefficients) && "(Intercept)" %in% rownames(summ_boot$coefficients$cond)) {
-                  est_b <- summ_boot$coefficients$cond["(Intercept)", "Estimate"]
-                  se_b <- summ_boot$coefficients$cond["(Intercept)", "Std. Error"]
-                  # Null centered test statistic for one-tailed test
-                  boots_glmm[b] <- (est_b - est) / se_b
-                } else {
-                  boots_glmm[b] <- NA
-                }
-              } else {
-                boots_glmm[b] <- NA
-              }
-            }
-
-            valid_boots <- boots_glmm[!is.na(boots_glmm)]
-            B_valid <- length(valid_boots)
-
-            if (B_valid > 0) {
-              glmm_boot_pval <- (sum(valid_boots > orig_stat) + 1) / (B_valid + 1)
-            } else {
-              glmm_boot_pval <- NA
-            }
-          },
-          error = function(e) NA
-        )
-      }
-    }
 
     if (has_valid_results || !is.null(res_rma_re) || !is.null(res_rma_fe) || !is.null(res_rma_3LRE)) {
       return(c(
         Meta_3LRE_LFC = re3L_lfc, Meta_3LRE_SE = re3L_se, Meta_3LRE_pval = re3L_pval,
         Meta_3LRE_boot_pval = boot_pval,
         Meta_FE_LFC = fe_lfc, Meta_FE_SE = fe_se, Meta_FE_pval = fe_pval,
-        Meta_EBM_pval = ebm_pval,
         Meta_Stouffer_Z = stouffer_z,
         Meta_Stouffer_pval = stouffer_pval,
         Meta_DirectionalStouffer_Z = dir_stouffer_z,
@@ -1633,7 +1503,6 @@ meta_results <- lapply(seq_len(n_genes), function(i) {
     Meta_3LRE_LFC = NA, Meta_3LRE_SE = NA, Meta_3LRE_pval = NA,
     Meta_3LRE_boot_pval = NA,
     Meta_FE_LFC = NA, Meta_FE_SE = NA, Meta_FE_pval = NA,
-    Meta_EBM_pval = NA,
     Meta_Stouffer_Z = NA,
     Meta_Stouffer_pval = NA,
     Meta_DirectionalStouffer_Z = NA,
@@ -1652,7 +1521,6 @@ meta_results_df$cluster_id <- rownames(lfc_matrix)
 meta_results_df$Meta_3LRE_padj <- p.adjust(meta_results_df$Meta_3LRE_pval, method = "BH")
 meta_results_df$Meta_3LRE_boot_padj <- p.adjust(meta_results_df$Meta_3LRE_boot_pval, method = "BH")
 meta_results_df$Meta_FE_padj <- p.adjust(meta_results_df$Meta_FE_pval, method = "BH")
-meta_results_df$Meta_EBM_padj <- p.adjust(meta_results_df$Meta_EBM_pval, method = "BH")
 meta_results_df$Meta_Stouffer_padj <- p.adjust(meta_results_df$Meta_Stouffer_pval, method = "BH")
 meta_results_df$Meta_DirectionalStouffer_padj <- p.adjust(meta_results_df$Meta_DirectionalStouffer_pval, method = "BH")
 meta_results_df$Meta_RE_Stouffer_padj <- p.adjust(meta_results_df$Meta_RE_Stouffer_pval, method = "BH")
