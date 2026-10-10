@@ -907,7 +907,7 @@ if (length(microarray_files) > 0) {
     }
 
     # Enforce uniqueness instead of aggregating
-    df_filtered <- df %>% filter(!is.na(cluster_id) & cluster_id %in% rownames(cts))
+    df_filtered <- df %>% dplyr::filter(!is.na(cluster_id) & cluster_id %in% rownames(cts))
     if (any(duplicated(df_filtered$cluster_id))) {
       stop(paste("CRITICAL ERROR: Duplicate cluster_id found in microarray dataset", comp_name))
     }
@@ -1553,7 +1553,7 @@ res_df_export <- data.frame(cluster_id = rownames(lfc_matrix), stringsAsFactors 
 res_df_export <- left_join(res_df_export, cluster_annotation, by = "cluster_id")
 res_df_export <- left_join(res_df_export, meta_results_df, by = "cluster_id")
 
-res_df_export <- res_df_export %>% select(
+res_df_export <- res_df_export %>% dplyr::select(
   cluster_id, Representative_Gene, All_Genes_Locus_Tags, baseMean, Mean_Absolute_LFC,
   Meta_Stouffer_Z, Meta_Stouffer_pval, Meta_Stouffer_padj,
   Meta_DirectionalStouffer_Z, Meta_DirectionalStouffer_pval, Meta_DirectionalStouffer_padj,
@@ -1580,29 +1580,29 @@ write.csv(res_df_export, file = out_file_all, row.names = FALSE)
 cat("✓ Exported", out_file_all, "\n")
 
 # Export Significant Results - 3-Level RE Model
-res_df_sig_3lre <- res_df_export %>% filter(!is.na(Meta_3LRE_padj) & Meta_3LRE_padj < 0.05 & abs(Meta_3LRE_LFC) > 0.5)
+res_df_sig_3lre <- res_df_export %>% dplyr::filter(!is.na(Meta_3LRE_padj) & Meta_3LRE_padj < 0.05 & abs(Meta_3LRE_LFC) > 0.5)
 write.csv(res_df_sig_3lre, file = file.path(out_dir, "DESeq2_contrast_results_significant_Meta3LRE.csv"), row.names = FALSE)
 
 # Export Significant Results - 3-Level RE Model (Bootstrapped)
 if (opt$use_cwb) {
-  res_df_sig_3lre_boot <- res_df_export %>% filter(!is.na(Meta_3LRE_boot_padj) & Meta_3LRE_boot_padj < 0.05 & abs(Meta_3LRE_LFC) > 0.5)
+  res_df_sig_3lre_boot <- res_df_export %>% dplyr::filter(!is.na(Meta_3LRE_boot_padj) & Meta_3LRE_boot_padj < 0.05 & abs(Meta_3LRE_LFC) > 0.5)
   write.csv(res_df_sig_3lre_boot, file = file.path(out_dir, "DESeq2_contrast_results_significant_Meta3LRE_Boot.csv"), row.names = FALSE)
 }
 
 # Export Significant Results - FE Model
-res_df_sig_fe <- res_df_export %>% filter(!is.na(Meta_FE_padj) & Meta_FE_padj < 0.05 & abs(Meta_FE_LFC) > 0.5)
+res_df_sig_fe <- res_df_export %>% dplyr::filter(!is.na(Meta_FE_padj) & Meta_FE_padj < 0.05 & abs(Meta_FE_LFC) > 0.5)
 write.csv(res_df_sig_fe, file = file.path(out_dir, "DESeq2_contrast_results_significant_MetaFE.csv"), row.names = FALSE)
 
 # Export Significant Results - Two-Sided Stouffer's
-res_df_sig_stouffer <- res_df_export %>% filter(!is.na(Meta_Stouffer_padj) & Meta_Stouffer_padj < 0.05 & !is.na(Mean_Absolute_LFC) & Mean_Absolute_LFC > 0.5)
+res_df_sig_stouffer <- res_df_export %>% dplyr::filter(!is.na(Meta_Stouffer_padj) & Meta_Stouffer_padj < 0.05 & !is.na(Mean_Absolute_LFC) & Mean_Absolute_LFC > 0.5)
 write.csv(res_df_sig_stouffer, file = file.path(out_dir, "DESeq2_contrast_results_significant_MetaStouffer.csv"), row.names = FALSE)
 
 # Export Significant Results - Direction-Aware Stouffer's
-res_df_sig_dir_stouffer <- res_df_export %>% filter(!is.na(Meta_DirectionalStouffer_padj) & Meta_DirectionalStouffer_padj < 0.05 & !is.na(Meta_FE_LFC) & Meta_FE_LFC > 0.5)
+res_df_sig_dir_stouffer <- res_df_export %>% dplyr::filter(!is.na(Meta_DirectionalStouffer_padj) & Meta_DirectionalStouffer_padj < 0.05 & !is.na(Meta_FE_LFC) & Meta_FE_LFC > 0.5)
 write.csv(res_df_sig_dir_stouffer, file = file.path(out_dir, "DESeq2_contrast_results_significant_MetaDirectionalStouffer.csv"), row.names = FALSE)
 
 # Export Significant Results - RE Stouffer's
-res_df_sig_re_stouffer <- res_df_export %>% filter(!is.na(Meta_RE_Stouffer_padj) & Meta_RE_Stouffer_padj < 0.05 & !is.na(Mean_Absolute_LFC) & Mean_Absolute_LFC > 0.5)
+res_df_sig_re_stouffer <- res_df_export %>% dplyr::filter(!is.na(Meta_RE_Stouffer_padj) & Meta_RE_Stouffer_padj < 0.05 & !is.na(Mean_Absolute_LFC) & Mean_Absolute_LFC > 0.5)
 write.csv(res_df_sig_re_stouffer, file = file.path(out_dir, "DESeq2_contrast_results_significant_MetaREStouffer.csv"), row.names = FALSE)
 
 
