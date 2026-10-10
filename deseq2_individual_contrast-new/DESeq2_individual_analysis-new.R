@@ -17,7 +17,7 @@ library(optparse)
 
 option_list <- list(
   make_option(c("-s", "--sample_dir"),
-    type = "character", default = "sample_info-all",
+    type = "character", default = "sample_info-biofilm-to-planktonic",
     help = "Directory containing sample info files [default= %default]", metavar = "character"
   ),
   make_option(c("-m", "--min_datasets"),
@@ -65,7 +65,7 @@ option_list <- list(
     help = "Adjusted p-value threshold for ORA gene selection [default= %default]", metavar = "numeric"
   ),
   make_option(c("--ora_lfc"),
-    type = "numeric", default = 1.0,
+    type = "numeric", default = 0.5,
     help = "Absolute log2FC threshold for ORA gene selection [default= %default]", metavar = "numeric"
   ),
   make_option(c("--gaf_file"),
@@ -680,10 +680,10 @@ for (gse_id in unique_gses) {
   }
   out_vcov_dir <- file.path(out_dir, "deseq2_var_cov_results")
   vcov_file <- file.path(out_vcov_dir, paste0(gse_id, "_variance_covariance.csv"))
-  
+
   cov_mats_gse <- list()
   valid_genes <- rownames(dds_gse)
-  
+
   if (file.exists(vcov_file)) {
     cat("  Found existing variance-covariance matrix file for", gse_id, ". Loading it...
 ")
@@ -942,6 +942,8 @@ pval_matrix <- do.call(cbind, pval_list)
 rownames(lfc_matrix) <- rownames(cts)
 rownames(se_matrix) <- rownames(cts)
 rownames(pval_matrix) <- rownames(cts)
+# Setup effective sample sizes (N_eff) vector needed for RE Stouffer weights
+neff_vec <- unlist(neff_list)[colnames(pval_matrix)]
 
 # --- 5. Metafor Heterogeneity Analysis ---
 cat("\n=== RUNNING METAFOR HETEROGENEITY ANALYSIS ===\n")
@@ -1735,8 +1737,6 @@ write.csv(res_df_sig_dir_stouffer, file = file.path(out_dir, "DESeq2_contrast_re
 res_df_sig_re_stouffer <- res_df_export %>% filter(!is.na(Meta_RE_Stouffer_padj) & Meta_RE_Stouffer_padj < 0.05 & !is.na(Mean_Absolute_LFC) & Mean_Absolute_LFC > 0.5)
 write.csv(res_df_sig_re_stouffer, file = file.path(out_dir, "DESeq2_contrast_results_significant_MetaREStouffer.csv"), row.names = FALSE)
 
-# Export Significant Results - Direction-Ignore LRE
-write.csv(res_df_sig_glmm, file = file.path(out_dir, "DESeq2_contrast_results_significant_MetaDirIgnoreLRE.csv"), row.names = FALSE)
 
 
 # Export Individual Dataset Coefficients (Sign-Adjusted LFCs and SEs)
@@ -1754,6 +1754,21 @@ for (comp_name in colnames(lfc_matrix)) {
 out_file_coefs <- file.path(out_dir, "dataset_coefficients.csv")
 write.csv(coef_df_export, file = out_file_coefs, row.names = FALSE)
 cat("✓ Exported dataset coefficients to", out_file_coefs, "\n")
+
+# --- TopGO / ORA Meta-Analysis ---
+source("ora_meta_analysis.R")
+run_ora_meta_analysis(
+  gaf_file = opt$gaf_file,
+  lfc_list = lfc_list,
+  pval_list = pval_list,
+  cts = cts,
+  cluster_annotation = cluster_annotation,
+  comparison_gse_map = comparison_gse_map,
+  min_ds = min_ds,
+  out_dir = out_dir,
+  ora_padj = opt$ora_padj,
+  ora_lfc = opt$ora_lfc
+)
 
 # --- 6. Visualizations ---
 cat("\n=== GENERATING VISUALIZATIONS ===\n")
@@ -1842,58 +1857,6 @@ tryCatch(
 )
 
 
-# PCA Plot (based on variance-stabilized data of raw counts for visualization ONLY)
-cat("Generating Global PCA plot of combined raw counts...\n")
-tryCatch(
-  {
-    # We create a lightweight global dds just for VST and PCA, without running DESeq()
-    factors <- c()
-    if (length(unique(colData$Batch)) > 1) factors <- c(factors, "Batch")
-    if (length(unique(colData$GSE)) > 1) factors <- c(factors, "GSE")
-
-    if (length(factors) > 0) {
-      design_form_global <- as.formula(paste("~", paste(factors, collapse = " + ")))
-    } else {
-      design_form_global <- ~1
-    }
-
-    dds_global <- DESeqDataSetFromMatrix(
-      countData = cts,
-      colData = colData,
-      design = design_form_global
-    )
-
-    vsd <- vst(dds_global, blind = FALSE, nsub = min(1000, nrow(dds_global)))
-    mat <- assay(vsd)
-
-    # Batch correct the GSE effect for visualization
-    if (length(unique(colData$GSE)) > 1) {
-      mat <- limma::removeBatchEffect(mat, batch = vsd$GSE)
-    }
-    assay(vsd) <- mat
-
-    pca_data <- plotPCA(vsd, intgroup = c("Group", "GSE"), returnData = TRUE)
-    percentVar <- round(100 * attr(pca_data, "percentVar"))
-
-    p_pca <- ggplot(pca_data, aes(x = PC1, y = PC2, color = Group, shape = GSE)) +
-      geom_point(size = 3, alpha = 0.8) +
-      scale_shape_manual(values = rep(1:20, length.out = length(unique(colData$GSE)))) +
-      labs(
-        title = "PCA (VST, GSE Batch-Corrected)",
-        x = paste0("PC1: ", percentVar[1], "% variance"),
-        y = paste0("PC2: ", percentVar[2], "% variance"),
-        subtitle = "Visualization based on combined raw counts"
-      ) +
-      theme_minimal()
-
-    ggsave(file.path(vis_dir, "PCA_Batch_Corrected_Combined.png"), p_pca, width = 10, height = 8, dpi = 300)
-    cat("✓ Global PCA plot saved\n")
-  },
-  error = function(e) {
-    cat("⚠ Could not generate PCA plots:", e$message, "\n")
-  }
-)
-
 # Function to generate Forest Plots
 generate_forest_plot <- function(res_df_export, lfc_matrix, se_matrix, model_type, vis_dir) {
   if (model_type == "3LRE") {
@@ -1937,7 +1900,8 @@ generate_forest_plot <- function(res_df_export, lfc_matrix, se_matrix, model_typ
     se_col <- NA
     overall_label <- "Overall (RE Stouffer)"
     plot_title <- "Forest Plot of Log2 Fold Changes (Top 15 RE Stouffer Significant Genes)"
-    file_name <- "ForestPlot_Top15_REStouffer_Genes.png" } else {
+    file_name <- "ForestPlot_Top15_REStouffer_Genes.png"
+  } else {
     stop("Unknown model type")
   }
 
@@ -2181,20 +2145,6 @@ tryCatch(
   }
 )
 
-# --- 7. TopGO / ORA Meta-Analysis ---
-source("ora_meta_analysis.R")
-run_ora_meta_analysis(
-  gaf_file = opt$gaf_file,
-  lfc_list = lfc_list,
-  pval_list = pval_list,
-  cts = cts,
-  cluster_annotation = cluster_annotation,
-  comparison_gse_map = comparison_gse_map,
-  min_ds = min_ds,
-  out_dir = out_dir,
-  ora_padj = opt$ora_padj,
-  ora_lfc = opt$ora_lfc
-)
 
 cat("\n=== ANALYSIS COMPLETE ===\n")
 sink()
