@@ -154,6 +154,7 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
       cat("  Meta-analyzing", length(all_go_ids), "GO terms across", length(ora_comparisons), "comparisons...\n")
       
       ora_meta_res <- list()
+      debug_printed <- FALSE
       for (i in seq_along(all_go_ids)) {
         go_id <- all_go_ids[i]
         yi_go <- ora_yi[i, ]
@@ -184,6 +185,18 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
             metafor::vcalc(vi = vi_go[valid_go], cluster = valid_cov_cluster, rho = 0.5),
             error = function(e) vi_go[valid_go]
           )
+          
+          if (!debug_printed) {
+            cat("\n--- DEBUG: V_mat_logor for GO term", go_id, "---\n")
+            cat("Comparisons:\n")
+            print(valid_comp_go)
+            cat("\nClusters (valid_cov_cluster):\n")
+            print(valid_cov_cluster)
+            cat("\nVariance-Covariance Matrix (V_mat_logor):\n")
+            print(V_mat_logor)
+            cat("-----------------------------------------------\n\n")
+            debug_printed <- TRUE
+          }
           
           # LogOR Meta-Analysis
           res_re <- tryCatch(
