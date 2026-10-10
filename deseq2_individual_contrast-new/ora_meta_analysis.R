@@ -153,7 +153,7 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
         valid_gse_go <- ora_gse_map[valid_go]
         valid_comp_go <- ora_comparisons[valid_go]
         
-        if (sum(valid_go) >= max(2, min_ds)) {
+        if (length(unique(valid_gse_go)) >= max(2, min_ds)) {
           res_re <- tryCatch(
             metafor::rma.mv(yi = yi_go[valid_go], V = vi_go[valid_go], random = ~ 1 | valid_gse_go / valid_comp_go, method = "REML"),
             error = function(e) {
