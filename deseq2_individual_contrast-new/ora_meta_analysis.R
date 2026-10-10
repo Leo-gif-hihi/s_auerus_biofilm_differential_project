@@ -3,6 +3,8 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
   if (!is.null(gaf_file) && file.exists(gaf_file)) {
     cat("Loading GAF file:", gaf_file, "\n")
     
+    # --- 1. Setup and Package Loading ---
+    # Ensure required Bioconductor and CRAN packages are installed and loaded
     if (!requireNamespace("clusterProfiler", quietly = TRUE)) {
       if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager", repos = "https://cloud.r-project.org")
       BiocManager::install("clusterProfiler", update = FALSE, ask = FALSE)
@@ -19,6 +21,8 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
     suppressPackageStartupMessages(library(GO.db))
     suppressPackageStartupMessages(library(clubSandwich))
     
+    # --- 2. GAF Parsing and Cluster ID Mapping ---
+    # Read the custom GAF file and map dataset cluster IDs to standard gene symbols
     gaf <- read.delim(gaf_file, comment.char = "!", header = FALSE, stringsAsFactors = FALSE, quote="")
     term2gene <- unique(data.frame(term = gaf$V5, gene = gaf$V3, stringsAsFactors = FALSE))
     
@@ -44,6 +48,8 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
     ora_comparisons <- c()
     ora_gse_map <- c()
     
+    # --- 3. Compute ORA for Each Comparison ---
+    # Iterate through each dataset contrast to perform dataset-specific over-representation analysis
     for (comp_name in names(lfc_list)) {
       gse_id <- comparison_gse_map[comp_name]
       
@@ -85,6 +91,9 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
         )
       }, error = function(e) NULL)
       
+      # --- 4. Calculate Log Odds Ratios ---
+      # If ORA returns results, compute the continuous Log Odds Ratio (logOR) and Standard Error (SE)
+      # using the Haldane-Anscombe correction (+0.5) to avoid zeroes
       if (!is.null(ora_res) && nrow(ora_res@result) > 0) {
         res_df <- ora_res@result
         
@@ -115,6 +124,8 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
       }
     }
     
+    # --- 5. Aggregate Effect Sizes ---
+    # Combine the logOR and SE from all individual comparisons into master matrices
     if (length(ora_logor_list) > 0) {
       all_go_ids <- unique(unlist(lapply(ora_logor_list, names)))
       
@@ -134,6 +145,8 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
         yi_go <- ora_yi[i, ]
         vi_go <- ora_vi[i, ]
         
+        # --- 6. Meta-Analyze Each GO Term ---
+        # Fit 3-Level Random Effects (w/ clubSandwich RVE) and Fixed Effects models
         valid_go <- !is.na(yi_go) & !is.na(vi_go)
         valid_gse_go <- ora_gse_map[valid_go]
         valid_comp_go <- ora_comparisons[valid_go]
@@ -180,6 +193,8 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
         }
       }
       
+      # --- 7. Save and Export Results ---
+      # Combine all meta-analyzed GO terms, sort by Random-Effects p-value, and export to CSV
       if (length(ora_meta_res) > 0) {
         ora_meta_df <- do.call(rbind, ora_meta_res)
         ora_meta_df <- ora_meta_df[order(ora_meta_df$RE_pval), ]
