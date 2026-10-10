@@ -42,6 +42,7 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
     
     goterms <- as.data.frame(GO.db::GOTERM)
     term2name <- unique(data.frame(term = goterms$go_id, name = goterms$Term, stringsAsFactors = FALSE))
+    term2ontology <- unique(data.frame(term = goterms$go_id, ontology = goterms$Ontology, stringsAsFactors = FALSE))
     
     ora_logor_list <- list()
     ora_se_list <- list()
@@ -178,6 +179,7 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, cts, cluster_an
           if (!is.null(res_re) && !is.null(res_fe)) {
             ora_meta_res[[go_id]] <- data.frame(
               ID = go_id,
+              Ontology = term2ontology$ontology[match(go_id, term2ontology$term)],
               Description = term2name$name[match(go_id, term2name$term)],
               RE_logOR = res_re$beta[1],
               RE_SE = res_re$se[1],
