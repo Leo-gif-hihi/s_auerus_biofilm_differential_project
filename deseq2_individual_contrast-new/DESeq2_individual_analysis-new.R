@@ -1013,20 +1013,6 @@ meta_results <- lapply(seq_len(n_genes), function(i) {
     valid_gse <- valid_gse_all
     valid_comparison <- names(yi)[valid]
 
-    # Fit Random-Effects Model (Multilevel)
-    res_rma_re <- tryCatch(
-      {
-        metafor::rma.mv(yi = yi[valid], V = vi, random = ~ 1 | valid_gse, method = "REML", test = "t")
-      },
-      error = function(e) {
-        tryCatch(
-          {
-            metafor::rma.mv(yi = yi[valid], V = vi, random = ~ 1 | valid_gse, method = "REML", test = "t", control = list(optimizer = "optim", optmethod = "Nelder-Mead"))
-          },
-          error = function(e2) NULL
-        )
-      }
-    )
 
     # Exact variance-covariance matrix of dependent estimates
     V_mat <- tryCatch(
@@ -1105,29 +1091,11 @@ meta_results <- lapply(seq_len(n_genes), function(i) {
     # Fit Fixed-Effects Model
     res_rma_fe <- tryCatch(
       {
-        metafor::rma.mv(yi = yi[valid], V = V_mat, test = "t")
+        metafor::rma.mv(yi = yi[valid], V = V_mat)
       },
       error = function(e) NULL
     )
 
-    if (!is.null(res_rma_re)) {
-      tau2 <- res_rma_re$sigma2[1]
-
-      # Pseudo-I2 calculation
-      I2 <- calculate_pseudo_i2(vi, tau2)
-
-      re_lfc <- res_rma_re$beta[1]
-      re_se <- res_rma_re$se[1]
-      re_pval <- res_rma_re$pval[1]
-      het_pval <- res_rma_re$QEp
-    } else {
-      re_lfc <- NA
-      re_se <- NA
-      re_pval <- NA
-      tau2 <- NA
-      I2 <- NA
-      het_pval <- NA
-    }
 
     if (!is.null(res_rma_3LRE)) {
       tau2_Level3 <- res_rma_3LRE$sigma2[1]
@@ -1483,7 +1451,7 @@ meta_results <- lapply(seq_len(n_genes), function(i) {
     }
 
 
-    if (has_valid_results || !is.null(res_rma_re) || !is.null(res_rma_fe) || !is.null(res_rma_3LRE)) {
+    if (has_valid_results || !is.null(res_rma_fe) || !is.null(res_rma_3LRE)) {
       return(c(
         Meta_3LRE_LFC = re3L_lfc, Meta_3LRE_SE = re3L_se, Meta_3LRE_pval = re3L_pval,
         Meta_3LRE_boot_pval = boot_pval,
@@ -1493,7 +1461,6 @@ meta_results <- lapply(seq_len(n_genes), function(i) {
         Meta_DirectionalStouffer_Z = dir_stouffer_z,
         Meta_DirectionalStouffer_pval = dir_stouffer_pval,
         Meta_RE_Stouffer_Z = re_stouffer_z, Meta_RE_Stouffer_SE = re_stouffer_se, Meta_RE_Stouffer_pval = re_stouffer_pval, Meta_RE_Stouffer_boot_pval = boot_re_stouffer_pval, Meta_RE_Stouffer_ddf = df_robust,
-        Heterogeneity_tau2 = tau2, Heterogeneity_I2 = I2, Heterogeneity_pval = het_pval,
         Heterogeneity_3L_tau2_Level3 = tau2_Level3, Heterogeneity_3L_tau2_Level2 = tau2_Level2,
         Heterogeneity_3L_I2_Level3 = I2_Level3, Heterogeneity_3L_I2_Level2 = I2_Level2,
         Heterogeneity_3L_pval = het3L_pval
@@ -1509,7 +1476,6 @@ meta_results <- lapply(seq_len(n_genes), function(i) {
     Meta_DirectionalStouffer_Z = NA,
     Meta_DirectionalStouffer_pval = NA,
     Meta_RE_Stouffer_Z = NA, Meta_RE_Stouffer_SE = NA, Meta_RE_Stouffer_pval = NA, Meta_RE_Stouffer_boot_pval = NA, Meta_RE_Stouffer_ddf = NA,
-    Heterogeneity_tau2 = NA, Heterogeneity_I2 = NA, Heterogeneity_pval = NA,
     Heterogeneity_3L_tau2_Level3 = NA, Heterogeneity_3L_tau2_Level2 = NA,
     Heterogeneity_3L_I2_Level3 = NA, Heterogeneity_3L_I2_Level2 = NA,
     Heterogeneity_3L_pval = NA
@@ -1526,7 +1492,6 @@ meta_results_df$Meta_Stouffer_padj <- p.adjust(meta_results_df$Meta_Stouffer_pva
 meta_results_df$Meta_DirectionalStouffer_padj <- p.adjust(meta_results_df$Meta_DirectionalStouffer_pval, method = "BH")
 meta_results_df$Meta_RE_Stouffer_padj <- p.adjust(meta_results_df$Meta_RE_Stouffer_pval, method = "BH")
 meta_results_df$Meta_RE_Stouffer_boot_padj <- p.adjust(meta_results_df$Meta_RE_Stouffer_boot_pval, method = "BH")
-meta_results_df$Heterogeneity_padj <- p.adjust(meta_results_df$Heterogeneity_pval, method = "BH")
 meta_results_df$Heterogeneity_3L_padj <- p.adjust(meta_results_df$Heterogeneity_3L_pval, method = "BH")
 
 # Variance-weighted mean of absolute LFCs (Inverse Variance Weighting)
@@ -1563,7 +1528,6 @@ res_df_export <- res_df_export %>% dplyr::select(
   Meta_3LRE_boot_pval, Meta_3LRE_boot_padj,
   Meta_FE_LFC, Meta_FE_SE, Meta_FE_pval, Meta_FE_padj,
   Heterogeneity_3L_I2_Level3, Heterogeneity_3L_I2_Level2, Heterogeneity_3L_tau2_Level3, Heterogeneity_3L_tau2_Level2, Heterogeneity_3L_pval, Heterogeneity_3L_padj,
-  Heterogeneity_I2, Heterogeneity_tau2, Heterogeneity_pval, Heterogeneity_padj,
   everything()
 )
 
