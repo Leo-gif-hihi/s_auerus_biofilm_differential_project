@@ -1,5 +1,9 @@
 run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, cluster_annotation, comparison_gse_map, comparison_control_map = NULL, min_ds, out_dir, ora_padj = 0.05, ora_lfc = 1.0) {
   cat("\n=== RUNNING OVER-REPRESENTATION META-ANALYSIS ===\n")
+
+  # Convert a two-sided p-value to a one-sided p-value testing estimate > 0.
+  # Positive estimate: halve p. Negative estimate: 1 - p/2 (never significant).
+  one_sided_p <- function(est, p) ifelse(est > 0, p / 2, 1 - p / 2)
   if (!is.null(gaf_file) && file.exists(gaf_file)) {
     cat("Loading GAF file:", gaf_file, "\n")
 
@@ -323,16 +327,16 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
               Description = term2name$name[match(go_id, term2name$term)],
               logOR_RE_estimate = res_re$beta[1],
               logOR_RE_SE = res_re$se[1],
-              logOR_RE_pval = res_re$pval[1],
+              logOR_RE_pval = one_sided_p(res_re$beta[1], res_re$pval[1]),
               logOR_FE_estimate = res_fe$beta[1],
               logOR_FE_SE = res_fe$se[1],
-              logOR_FE_pval = res_fe$pval[1],
+              logOR_FE_pval = one_sided_p(res_fe$beta[1], res_fe$pval[1]),
               Z_RE_estimate = res_z_re$beta[1],
               Z_RE_SE = res_z_re$se[1],
-              Z_RE_pval = res_z_re$pval[1],
+              Z_RE_pval = one_sided_p(res_z_re$beta[1], res_z_re$pval[1]),
               Z_FE_estimate = res_z_fe$beta[1],
               Z_FE_SE = res_z_fe$se[1],
-              Z_FE_pval = res_z_fe$pval[1],
+              Z_FE_pval = one_sided_p(res_z_fe$beta[1], res_z_fe$pval[1]),
               N_comparisons = sum(valid_go),
               N_datasets = length(unique(valid_gse_go)),
               stringsAsFactors = FALSE
@@ -423,10 +427,10 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
               Description = term2name$name[match(go_id, term2name$term)],
               GSEA_Z_RE_estimate = res_re$beta[1],
               GSEA_Z_RE_SE = res_re$se[1],
-              GSEA_Z_RE_pval = res_re$pval[1],
+              GSEA_Z_RE_pval = one_sided_p(res_re$beta[1], res_re$pval[1]),
               GSEA_Z_FE_estimate = res_fe$beta[1],
               GSEA_Z_FE_SE = res_fe$se[1],
-              GSEA_Z_FE_pval = res_fe$pval[1],
+              GSEA_Z_FE_pval = one_sided_p(res_fe$beta[1], res_fe$pval[1]),
               N_comparisons = sum(valid_go),
               N_datasets = length(unique(valid_gse_go)),
               stringsAsFactors = FALSE
