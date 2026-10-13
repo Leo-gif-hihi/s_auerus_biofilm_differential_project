@@ -30,6 +30,15 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
     gaf <- read.delim(gaf_file, comment.char = "!", header = FALSE, stringsAsFactors = FALSE, quote = "")
     term2gene <- unique(data.frame(term = gaf$V5, gene = gaf$V3, stringsAsFactors = FALSE))
 
+    # The GAF contains only direct annotations. GO is a DAG, so a gene annotated to a
+    # term is implicitly annotated to all its ancestors. Propagate them with buildGOmap().
+    n_direct <- nrow(term2gene)
+    term2gene <- clusterProfiler::buildGOmap(term2gene)
+    term2gene <- unique(data.frame(term = as.character(term2gene[[1]]), gene = as.character(term2gene[[2]]), stringsAsFactors = FALSE))
+    # Drop the ontology root terms (BP/MF/CC), which contain every gene and carry no information
+    term2gene <- term2gene[grepl("^GO:", term2gene$term) & !term2gene$term %in% c("GO:0008150", "GO:0003674", "GO:0005575"), ]
+    cat(sprintf("  Propagated GO annotations: %d direct -> %d direct+indirect term-gene pairs\n", n_direct, nrow(term2gene)))
+
     annotated_genes <- unique(gaf$V3)
 
     cluster_id_to_symbol <- sapply(cluster_annotation$All_Genes_Locus_Tags, function(tags) {
