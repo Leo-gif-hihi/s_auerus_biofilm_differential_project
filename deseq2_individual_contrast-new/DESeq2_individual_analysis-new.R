@@ -17,7 +17,7 @@ library(optparse)
 
 option_list <- list(
   make_option(c("-s", "--sample_dir"),
-    type = "character", default = "sample_info-biofilm-to-biofilm",
+    type = "character", default = "sample_info-planktonic-to-planktonic",
     help = "Directory containing sample info files [default= %default]", metavar = "character"
   ),
   make_option(c("-m", "--min_datasets"),
@@ -1483,7 +1483,6 @@ meta_results <- lapply(seq_len(n_genes), function(i) {
     }
 
 
-
     if (has_valid_results || !is.null(res_rma_re) || !is.null(res_rma_fe) || !is.null(res_rma_3LRE)) {
       return(c(
         Meta_3LRE_LFC = re3L_lfc, Meta_3LRE_SE = re3L_se, Meta_3LRE_pval = re3L_pval,
@@ -1631,6 +1630,7 @@ run_ora_meta_analysis(
   gaf_file = opt$gaf_file,
   lfc_list = lfc_list,
   pval_list = pval_list,
+  se_list = se_list,
   cts = cts,
   cluster_annotation = cluster_annotation,
   comparison_gse_map = comparison_gse_map,
