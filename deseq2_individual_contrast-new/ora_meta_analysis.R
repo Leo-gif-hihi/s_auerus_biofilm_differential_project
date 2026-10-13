@@ -64,6 +64,7 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
     ora_z_list <- list()
     ora_z_se_list <- list()
     gsea_z_list <- list()
+    gsea_dirz_list <- list()
     ora_comparisons <- c()
     gsea_comparisons <- c()
     ora_gse_map <- c()
@@ -196,8 +197,15 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
         if (!is.null(gsea_res) && nrow(gsea_res@result) > 0) {
           res_df_g <- gsea_res@result
           safe_p <- pmax(res_df_g$pvalue, 1e-10)
+          # Direction-ignoring: one-sided z from the two-sided p (up OR down enrichment -> positive z)
           z_dir <- qnorm(safe_p, lower.tail = FALSE)
           gsea_z_list[[comp_name]] <- setNames(z_dir, res_df_g$ID)
+          # Direction-aware: signed z = sign(NES) * two-sided z. Positive = up in biofilm, negative = down.
+          # Lfcs are already sign-adjusted so that positive means increased in biofilm.
+          dir_sign <- sign(res_df_g$NES)
+          dir_sign[is.na(dir_sign) | dir_sign == 0] <- NA
+          signed_z <- dir_sign * qnorm(safe_p / 2, lower.tail = FALSE)
+          gsea_dirz_list[[comp_name]] <- setNames(signed_z, res_df_g$ID)
           gsea_comparisons <- c(gsea_comparisons, comp_name)
         }
       }
@@ -389,17 +397,36 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
     if (length(gsea_z_list) > 0) {
       all_gsea_ids <- unique(unlist(lapply(gsea_z_list, names)))
       gsea_yi <- matrix(NA, nrow = length(all_gsea_ids), ncol = length(gsea_z_list), dimnames = list(all_gsea_ids, gsea_comparisons))
+      gsea_dir_yi <- gsea_yi
       for (comp_name in gsea_comparisons) {
         gsea_yi[names(gsea_z_list[[comp_name]]), comp_name] <- gsea_z_list[[comp_name]]
+        gsea_dir_yi[names(gsea_dirz_list[[comp_name]]), comp_name] <- gsea_dirz_list[[comp_name]]
       }
+      gsea_gse_map <- comparison_gse_map[gsea_comparisons]
 
       cat("  Meta-analyzing", length(all_gsea_ids), "GO terms (GSEA) across", length(gsea_comparisons), "comparisons...\n")
       gsea_meta_res <- list()
+      # Fits 3-level RE (clubSandwich RVE) and FE models to a vector of z-scores
+      fit_gsea_meta <- function(yi, V, gse, comp) {
+        re <- tryCatch(
+          metafor::rma.mv(yi = yi, V = V, random = ~ 1 | gse / comp, method = "REML"),
+          error = function(e) NULL
+        )
+        if (!is.null(re)) {
+          re <- tryCatch(metafor::robust(re, cluster = gse, clubSandwich = TRUE), error = function(e) NULL)
+        }
+        fe <- tryCatch(metafor::rma.mv(yi = yi, V = V), error = function(e) NULL)
+        list(re = re, fe = fe)
+      }
+
       for (i in seq_along(all_gsea_ids)) {
         go_id <- all_gsea_ids[i]
         yi_go <- gsea_yi[i, ]
-        valid_go <- !is.na(yi_go)
-        valid_gse_go <- ora_gse_map[valid_go]
+        yi_dir_go <- gsea_dir_yi[i, ]
+        # Use only comparisons where both the direction-ignoring and signed z are defined,
+        # so a single covariance matrix serves both metrics
+        valid_go <- !is.na(yi_go) & !is.na(yi_dir_go)
+        valid_gse_go <- gsea_gse_map[valid_go]
         valid_comp_go <- gsea_comparisons[valid_go]
 
         if (length(unique(valid_gse_go)) >= max(2, min_ds)) {
@@ -416,30 +443,30 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
             error = function(e) rep(1, sum(valid_go))
           )
 
-          res_re <- tryCatch(
-            metafor::rma.mv(yi = yi_go[valid_go], V = V_mat_z, random = ~ 1 | valid_gse_go / valid_comp_go, method = "REML"),
-            error = function(e) NULL
-          )
-          if (!is.null(res_re)) {
-            res_re <- tryCatch(metafor::robust(res_re, cluster = valid_gse_go, clubSandwich = TRUE), error = function(e) NULL)
-          }
+          # Direction-ignoring metric
+          fit_nd <- fit_gsea_meta(yi_go[valid_go], V_mat_z, valid_gse_go, valid_comp_go)
+          # Direction-aware metric (signed z)
+          fit_d <- fit_gsea_meta(yi_dir_go[valid_go], V_mat_z, valid_gse_go, valid_comp_go)
 
-          res_fe <- tryCatch(
-            metafor::rma.mv(yi = yi_go[valid_go], V = V_mat_z),
-            error = function(e) NULL
-          )
-
-          if (!is.null(res_re) && !is.null(res_fe)) {
+          if (!is.null(fit_nd$re) && !is.null(fit_nd$fe) && !is.null(fit_d$re) && !is.null(fit_d$fe)) {
             gsea_meta_res[[go_id]] <- data.frame(
               ID = go_id,
               Ontology = term2ontology$ontology[match(go_id, term2ontology$term)],
               Description = term2name$name[match(go_id, term2name$term)],
-              GSEA_Z_RE_estimate = res_re$beta[1],
-              GSEA_Z_RE_SE = res_re$se[1],
-              GSEA_Z_RE_pval = one_sided_p(res_re$beta[1], res_re$pval[1]),
-              GSEA_Z_FE_estimate = res_fe$beta[1],
-              GSEA_Z_FE_SE = res_fe$se[1],
-              GSEA_Z_FE_pval = one_sided_p(res_fe$beta[1], res_fe$pval[1]),
+              # Direction-ignoring (one-sided: is enrichment, up or down, > 0)
+              GSEA_Z_RE_estimate = fit_nd$re$beta[1],
+              GSEA_Z_RE_SE = fit_nd$re$se[1],
+              GSEA_Z_RE_pval = one_sided_p(fit_nd$re$beta[1], fit_nd$re$pval[1]),
+              GSEA_Z_FE_estimate = fit_nd$fe$beta[1],
+              GSEA_Z_FE_SE = fit_nd$fe$se[1],
+              GSEA_Z_FE_pval = one_sided_p(fit_nd$fe$beta[1], fit_nd$fe$pval[1]),
+              # Direction-aware (signed z, two-sided: positive = up in biofilm, negative = down)
+              GSEA_DirZ_RE_estimate = fit_d$re$beta[1],
+              GSEA_DirZ_RE_SE = fit_d$re$se[1],
+              GSEA_DirZ_RE_pval = fit_d$re$pval[1],
+              GSEA_DirZ_FE_estimate = fit_d$fe$beta[1],
+              GSEA_DirZ_FE_SE = fit_d$fe$se[1],
+              GSEA_DirZ_FE_pval = fit_d$fe$pval[1],
               N_comparisons = sum(valid_go),
               N_datasets = length(unique(valid_gse_go)),
               stringsAsFactors = FALSE
@@ -452,6 +479,19 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
         gsea_df <- do.call(rbind, gsea_meta_res)
         gsea_df$GSEA_Z_RE_padj <- p.adjust(gsea_df$GSEA_Z_RE_pval, method = "BH")
         gsea_df$GSEA_Z_FE_padj <- p.adjust(gsea_df$GSEA_Z_FE_pval, method = "BH")
+        gsea_df$GSEA_DirZ_RE_padj <- p.adjust(gsea_df$GSEA_DirZ_RE_pval, method = "BH")
+        gsea_df$GSEA_DirZ_FE_padj <- p.adjust(gsea_df$GSEA_DirZ_FE_pval, method = "BH")
+        gsea_df$GSEA_Direction <- ifelse(is.na(gsea_df$GSEA_DirZ_RE_estimate), NA_character_,
+          ifelse(gsea_df$GSEA_DirZ_RE_estimate > 0, "Up", "Down")
+        )
+        gsea_df <- gsea_df[, c(
+          "ID", "Ontology", "Description",
+          "GSEA_Z_RE_estimate", "GSEA_Z_RE_SE", "GSEA_Z_RE_pval", "GSEA_Z_RE_padj",
+          "GSEA_Z_FE_estimate", "GSEA_Z_FE_SE", "GSEA_Z_FE_pval", "GSEA_Z_FE_padj",
+          "GSEA_DirZ_RE_estimate", "GSEA_DirZ_RE_SE", "GSEA_DirZ_RE_pval", "GSEA_DirZ_RE_padj",
+          "GSEA_DirZ_FE_estimate", "GSEA_DirZ_FE_SE", "GSEA_DirZ_FE_pval", "GSEA_DirZ_FE_padj",
+          "GSEA_Direction", "N_comparisons", "N_datasets"
+        )]
         gsea_df <- gsea_df[order(gsea_df$GSEA_Z_RE_pval), ]
         write.csv(gsea_df, file.path(out_dir, "GSEA_Meta_Analysis_Results.csv"), row.names = FALSE)
         cat("  - Saved GSEA Meta-Analysis Results to", file.path(out_dir, "GSEA_Meta_Analysis_Results.csv"), "\n")
