@@ -183,8 +183,7 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
         if (!is.null(gsea_res) && nrow(gsea_res@result) > 0) {
           res_df_g <- gsea_res@result
           safe_p <- pmax(res_df_g$pvalue, 1e-10)
-          z_mag <- qnorm(safe_p, lower.tail = FALSE)
-          z_dir <- z_mag * sign(res_df_g$NES)
+          z_dir <- qnorm(safe_p, lower.tail = FALSE)
           gsea_z_list[[comp_name]] <- setNames(z_dir, res_df_g$ID)
           gsea_comparisons <- c(gsea_comparisons, comp_name)
         }
