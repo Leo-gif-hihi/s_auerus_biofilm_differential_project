@@ -1,0 +1,14 @@
+1. Ignore everything by default
+
+2. Allow Git to traverse all directories to find files inside subfolders
+
+!*/
+
+3. Allow only R script files
+
+!.R
+!.r
+
+4. Allow the gitignore file itself to be tracked
+
+!.gitignore
