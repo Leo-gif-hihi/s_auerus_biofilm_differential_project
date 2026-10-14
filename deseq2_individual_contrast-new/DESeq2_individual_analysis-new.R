@@ -17,7 +17,7 @@ library(optparse)
 
 option_list <- list(
   make_option(c("-s", "--sample_dir"),
-    type = "character", default = "sample_info-planktonic-to-planktonic",
+    type = "character", default = "sample_info-biofilm-to-biofilm",
     help = "Directory containing sample info files [default= %default]", metavar = "character"
   ),
   make_option(c("-m", "--min_datasets"),
@@ -71,6 +71,30 @@ option_list <- list(
   make_option(c("--gaf_file"),
     type = "character", default = "QuickGO-annotations-1764241851574-20251127.gaf",
     help = "Path to GAF file for GO annotations [default= %default]", metavar = "character"
+  ),
+  make_option(c("--skip_concordance"),
+    action = "store_true", default = FALSE,
+    help = "Skip gene-pair concordance meta-analysis [default= %default]"
+  ),
+  make_option(c("--concordance_mode"),
+    type = "character", default = "with_group",
+    help = "Concordance mode: 'with_group' or 'within_group' [default= %default]", metavar = "character"
+  ),
+  make_option(c("--concordance_min_k"),
+    type = "integer", default = 3,
+    help = "Minimum datasets measuring both genes in concordance analysis [default= %default]", metavar = "integer"
+  ),
+  make_option(c("--concordance_fdr"),
+    type = "numeric", default = 0.05,
+    help = "FDR threshold for calling consistent pairs [default= %default]", metavar = "numeric"
+  ),
+  make_option(c("--concordance_min_r"),
+    type = "numeric", default = 0.5,
+    help = "Minimum absolute pooled r for calling consistent pairs [default= %default]", metavar = "numeric"
+  ),
+  make_option(c("--concordance_max_i2"),
+    type = "numeric", default = 50,
+    help = "Maximum I2 percentage for calling consistent pairs [default= %default]", metavar = "numeric"
   )
 )
 
@@ -1604,6 +1628,25 @@ run_ora_meta_analysis(
   ora_padj = opt$ora_padj,
   ora_lfc = opt$ora_lfc
 )
+
+# --- Gene-Pair Concordance Meta-Analysis ---
+if (!isTRUE(opt$skip_concordance)) {
+  if (file.exists("concordance_meta_analysis.R")) {
+    source("concordance_meta_analysis.R")
+    run_concordance_meta_analysis(
+      dataset_dds_list   = dataset_dds_list,
+      out_dir            = out_dir,
+      cluster_annotation = cluster_annotation,
+      mode               = opt$concordance_mode,
+      min_k              = opt$concordance_min_k,
+      fdr_cut            = opt$concordance_fdr,
+      min_abs_r          = opt$concordance_min_r,
+      max_I2             = opt$concordance_max_i2
+    )
+  } else {
+    cat("  [Warning] concordance_meta_analysis.R not found. Skipping concordance analysis.\n")
+  }
+}
 
 # --- 6. Visualizations ---
 cat("\n=== GENERATING VISUALIZATIONS ===\n")
