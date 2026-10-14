@@ -95,8 +95,25 @@ option_list <- list(
   make_option(c("--concordance_max_i2"),
     type = "numeric", default = 50,
     help = "Maximum I2 percentage for calling consistent pairs [default= %default]", metavar = "numeric"
+  ),
+  make_option(c("--run_dropout"),
+    action = "store_true", default = FALSE,
+    help = "Perform drop-out permutation/sensitivity test across GSE dataset combinations [default= %default]"
+  ),
+  make_option(c("--run_permutation"),
+    action = "store_true", default = FALSE,
+    help = "Alias for --run_dropout [default= %default]"
+  ),
+  make_option(c("--min_dropout_datasets"),
+    type = "integer", default = 3,
+    help = "Minimum number of GSE datasets to evaluate in drop-out combinations [default= %default]", metavar = "integer"
+  ),
+  make_option(c("--force_rerun_dropout"),
+    action = "store_true", default = FALSE,
+    help = "Force re-running all drop-out combinations even if cached results exist [default= %default]"
   )
 )
+
 
 opt_parser <- OptionParser(option_list = option_list)
 opt <- parse_args(opt_parser)
@@ -971,10 +988,34 @@ rownames(pval_matrix) <- rownames(cts)
 # Setup effective sample sizes (N_eff) vector needed for RE Stouffer weights
 neff_vec <- unlist(neff_list)[colnames(pval_matrix)]
 
-# --- 5. Metafor Heterogeneity Analysis ---
-cat("\n=== RUNNING METAFOR HETEROGENEITY ANALYSIS ===\n")
+# --- 5. Metafor Heterogeneity Analysis or Drop-Out Test ---
+run_dropout_flag <- isTRUE(opt$run_dropout) || isTRUE(opt$run_permutation)
 
-cat("Computing tau^2, I^2, and meta-LFC (rma.mv) for", n_genes, "genes. This may take a moment...\n")
+if (run_dropout_flag) {
+  cat("\n=== RUNNING ONLY DROP-OUT TEST (--run_dropout enabled) ===\n")
+  cat("Skipping full-dataset multi-model analysis, ORA, concordance, and visualizations.\n")
+  if (file.exists("dropout_test.R")) {
+    source("dropout_test.R")
+    run_dropout_test(
+      lfc_matrix           = lfc_matrix,
+      se_matrix            = se_matrix,
+      pval_matrix          = pval_matrix,
+      comparison_gse_map   = comparison_gse_map,
+      sign_map             = sign_map,
+      all_cov_mats         = all_cov_mats,
+      cluster_annotation   = cluster_annotation,
+      min_datasets         = opt$min_datasets,
+      min_dropout_datasets = opt$min_dropout_datasets,
+      out_dir              = out_dir,
+      force_rerun          = isTRUE(opt$force_rerun_dropout)
+    )
+  } else {
+    stop("CRITICAL ERROR: dropout_test.R not found.")
+  }
+} else {
+  cat("\n=== RUNNING METAFOR HETEROGENEITY ANALYSIS ===\n")
+
+  cat("Computing tau^2, I^2, and meta-LFC (rma.mv) for", n_genes, "genes. This may take a moment...\n")
 
 # Function to calculate Pseudo-I2 given sampling variances and tau2 component(s)
 calculate_pseudo_i2 <- function(vi, tau2_vec) {
@@ -2024,5 +2065,8 @@ tryCatch(
 )
 
 
+} # close else (!run_dropout_flag)
+
 cat("\n=== ANALYSIS COMPLETE ===\n")
+
 sink()
