@@ -5,11 +5,13 @@
 # For each dataset combination, it runs 3-Level Random Effects (3LRE with clubSandwich RVE)
 # and Fixed Effects (FE) meta-analysis models, outputs detailed CSVs per combination,
 # and compiles a master dropout_summary.csv.
+# Supports multi-core parallel processing across genes via socket cluster (parLapplyLB).
 
 suppressPackageStartupMessages({
   library(dplyr)
   library(metafor)
   library(clubSandwich)
+  library(parallel)
 })
 
 # Helper function to calculate Pseudo-I2 given sampling variances and tau2 component(s)
@@ -26,16 +28,17 @@ calculate_pseudo_i2_dropout <- function(vi, tau2_vec) {
 }
 
 run_dropout_test <- function(lfc_matrix,
-                              se_matrix,
-                              pval_matrix,
-                              comparison_gse_map,
-                              sign_map,
-                              all_cov_mats,
-                              cluster_annotation,
-                              min_datasets = 0,
-                              min_dropout_datasets = 3,
-                              out_dir = ".",
-                              force_rerun = FALSE) {
+                             se_matrix,
+                             pval_matrix,
+                             comparison_gse_map,
+                             sign_map,
+                             all_cov_mats,
+                             cluster_annotation,
+                             min_datasets = 0,
+                             min_dropout_datasets = 3,
+                             out_dir = ".",
+                             force_rerun = FALSE,
+                             num_cores = NULL) {
 
   cat("\n", paste(rep("=", 70), collapse = ""), "\n")
   cat("=== RUNNING DATASET DROP-OUT / SENSITIVITY TEST ===\n")
@@ -55,6 +58,43 @@ run_dropout_test <- function(lfc_matrix,
   cat(sprintf("Total unique GSE datasets available: %d (%s)\n", N, paste(all_gses, collapse = ", ")))
   cat(sprintf("Configured minimum GSE datasets per combination (--min_dropout_datasets): %d\n", min_k))
   if (force_rerun) cat("  ⚠ --force_rerun_dropout enabled: Existing combination results will be recalculated.\n")
+
+  # Setup CPU multi-core parallel processing
+  total_avail_cores <- parallel::detectCores()
+  if (is.null(num_cores) || is.na(num_cores) || num_cores <= 0) {
+    num_cores <- min(12, max(1, total_avail_cores - 4))
+  } else {
+    num_cores <- min(as.integer(num_cores), total_avail_cores)
+  }
+
+  cl <- NULL
+  if (num_cores > 1) {
+    cat(sprintf("Configuring parallel computing: %d CPU worker cores (leaving %d threads free for OS/laptop tasks).\n",
+                num_cores, total_avail_cores - num_cores))
+    cl <- tryCatch({
+      cluster <- parallel::makeCluster(num_cores)
+      parallel::clusterEvalQ(cluster, {
+        suppressPackageStartupMessages({
+          library(metafor)
+          library(clubSandwich)
+        })
+      })
+      parallel::clusterExport(cluster, "calculate_pseudo_i2_dropout", envir = environment())
+      cluster
+    }, error = function(e) {
+      warning(sprintf("Could not initialize parallel cluster (%s). Falling back to sequential execution.", e$message))
+      NULL
+    })
+  } else {
+    cat("Running in single-threaded / sequential mode.\n")
+  }
+
+  # Ensure worker cluster is stopped cleanly when function exits
+  on.exit({
+    if (!is.null(cl)) {
+      try(parallel::stopCluster(cl), silent = TRUE)
+    }
+  }, add = TRUE)
 
   if (N < min_k) {
     cat(sprintf("  ⚠ Warning: Total GSE datasets (%d) is less than min_dropout_datasets (%d). Cannot perform drop-out test.\n", N, min_k))
@@ -153,6 +193,8 @@ run_dropout_test <- function(lfc_matrix,
       }
     }
 
+    t_comb_start <- proc.time()
+
     # Effective min datasets for gene inclusion in this combination
     eff_min_ds <- if (min_datasets == 0) k_cur else min(k_cur, min_datasets)
     eff_min_ds <- max(2, eff_min_ds)
@@ -173,8 +215,13 @@ run_dropout_test <- function(lfc_matrix,
     ds_count_per_gene <- rowSums(gse_has_gene)
     genes_to_fit <- which(ds_count_per_gene >= eff_min_ds)
 
-    cat(sprintf("  - %d / %d genes qualify (>= %d datasets). Running meta-analysis...\n",
-                length(genes_to_fit), n_genes, eff_min_ds))
+    if (!is.null(cl) && num_cores > 1) {
+      cat(sprintf("  - %d / %d genes qualify (>= %d datasets). Fitting meta-analysis models in parallel across %d CPU cores...\n",
+                  length(genes_to_fit), n_genes, eff_min_ds, num_cores))
+    } else {
+      cat(sprintf("  - %d / %d genes qualify (>= %d datasets). Running meta-analysis sequentially...\n",
+                  length(genes_to_fit), n_genes, eff_min_ds))
+    }
 
     # Output vectors
     re3L_lfc_vec <- rep(NA_real_, n_genes)
@@ -189,112 +236,177 @@ run_dropout_test <- function(lfc_matrix,
     I2_L2_vec <- rep(NA_real_, n_genes)
     het_pval_vec <- rep(NA_real_, n_genes)
 
-    if (length(genes_to_fit) > 0) {
-      pb <- txtProgressBar(min = 0, max = length(genes_to_fit), style = 3)
-      for (step_i in seq_along(genes_to_fit)) {
-        setTxtProgressBar(pb, step_i)
-        g_idx <- genes_to_fit[step_i]
-        gene_id <- all_genes[g_idx]
+    # Worker function to fit 3LRE and FE for a single gene index
+    fit_single_gene <- function(g_idx) {
+      gene_id <- all_genes[g_idx]
 
-        val_cols <- which(valid_mat[g_idx, ])
-        yi_val <- sub_lfc[g_idx, val_cols]
-        sei_val <- sub_se[g_idx, val_cols]
-        vi_val <- sei_val^2
-        val_comps <- comb_comps[val_cols]
-        val_gse <- sub_gse_map[val_cols]
-        n_val <- length(val_comps)
+      val_cols <- which(valid_mat[g_idx, ])
+      n_val <- length(val_cols)
+      if (n_val < 2) {
+        return(list(
+          g_idx = g_idx,
+          re3L_lfc = NA_real_, re3L_se = NA_real_, re3L_pval = NA_real_,
+          fe_lfc = NA_real_, fe_se = NA_real_, fe_pval = NA_real_,
+          tau2_L3 = NA_real_, tau2_L2 = NA_real_,
+          I2_L3 = NA_real_, I2_L2 = NA_real_,
+          het_pval = NA_real_
+        ))
+      }
 
-        # Construct variance-covariance matrix
-        V_exact <- diag(vi_val, nrow = n_val, ncol = n_val)
-        rownames(V_exact) <- val_comps
-        colnames(V_exact) <- val_comps
+      yi_val <- sub_lfc[g_idx, val_cols]
+      sei_val <- sub_se[g_idx, val_cols]
+      vi_val <- sei_val^2
+      val_comps <- comb_comps[val_cols]
+      val_gse <- sub_gse_map[val_cols]
 
-        for (r in 1:n_val) {
-          comp1 <- val_comps[r]
-          gse1 <- val_gse[r]
-          for (c in 1:n_val) {
-            comp2 <- val_comps[c]
-            gse2 <- val_gse[c]
-            if (r != c && gse1 == gse2) {
-              true_cov <- NA
-              if (!is.null(all_cov_mats[[gse1]])) {
-                if ("dataset_level" %in% names(all_cov_mats[[gse1]])) {
-                  true_cov <- all_cov_mats[[gse1]][["dataset_level"]][comp1, comp2]
-                } else if (!is.null(all_cov_mats[[gse1]][[gene_id]])) {
-                  true_cov <- all_cov_mats[[gse1]][[gene_id]][comp1, comp2]
-                }
+      # Construct variance-covariance matrix
+      V_exact <- diag(vi_val, nrow = n_val, ncol = n_val)
+      rownames(V_exact) <- val_comps
+      colnames(V_exact) <- val_comps
+
+      for (r in 1:n_val) {
+        comp1 <- val_comps[r]
+        gse1 <- val_gse[r]
+        for (c in 1:n_val) {
+          comp2 <- val_comps[c]
+          gse2 <- val_gse[c]
+          if (r != c && gse1 == gse2) {
+            true_cov <- NA
+            if (!is.null(all_cov_mats[[gse1]])) {
+              if ("dataset_level" %in% names(all_cov_mats[[gse1]])) {
+                true_cov <- all_cov_mats[[gse1]][["dataset_level"]][comp1, comp2]
+              } else if (!is.null(all_cov_mats[[gse1]][[gene_id]])) {
+                true_cov <- all_cov_mats[[gse1]][[gene_id]][comp1, comp2]
               }
-              if (!is.na(true_cov)) {
-                s1 <- sign_map[[comp1]]; if (is.null(s1) || is.na(s1)) s1 <- 1
-                s2 <- sign_map[[comp2]]; if (is.null(s2) || is.na(s2)) s2 <- 1
-                V_exact[r, c] <- true_cov * s1 * s2
-              }
+            }
+            if (!is.na(true_cov)) {
+              s1 <- sign_map[[comp1]]; if (is.null(s1) || is.na(s1)) s1 <- 1
+              s2 <- sign_map[[comp2]]; if (is.null(s2) || is.na(s2)) s2 <- 1
+              V_exact[r, c] <- true_cov * s1 * s2
             }
           }
         }
+      }
 
-        V_exact <- (V_exact + t(V_exact)) / 2
-        is_pd <- tryCatch({ chol(V_exact); TRUE }, error = function(e) FALSE)
-        if (!is_pd) {
-          diag(V_exact) <- diag(V_exact) + 1e-6
+      V_exact <- (V_exact + t(V_exact)) / 2
+      is_pd <- tryCatch({ chol(V_exact); TRUE }, error = function(e) FALSE)
+      if (!is_pd) {
+        diag(V_exact) <- diag(V_exact) + 1e-6
+      }
+
+      has_mult <- any(table(val_gse) > 1)
+      rnd_f <- if (has_mult) ~ 1 | val_gse / val_comps else ~ 1 | val_gse
+
+      # 3LRE Model
+      res_3lre <- tryCatch(
+        metafor::rma.mv(yi = yi_val, V = V_exact, random = rnd_f, method = "REML"),
+        error = function(e) {
+          tryCatch(
+            metafor::rma.mv(yi = yi_val, V = V_exact, random = rnd_f, method = "REML",
+                            control = list(optimizer = "optim", optmethod = "Nelder-Mead")),
+            error = function(e2) NULL
+          )
         }
+      )
 
-        has_mult <- any(table(val_gse) > 1)
-        rnd_f <- if (has_mult) ~ 1 | val_gse / val_comps else ~ 1 | val_gse
+      # FE Model
+      res_fe <- tryCatch(
+        metafor::rma.mv(yi = yi_val, V = V_exact),
+        error = function(e) NULL
+      )
 
-        # 3LRE Model
-        res_3lre <- tryCatch(
-          metafor::rma.mv(yi = yi_val, V = V_exact, random = rnd_f, method = "REML"),
-          error = function(e) {
-            tryCatch(
-              metafor::rma.mv(yi = yi_val, V = V_exact, random = rnd_f, method = "REML",
-                              control = list(optimizer = "optim", optmethod = "Nelder-Mead")),
-              error = function(e2) NULL
-            )
-          }
-        )
+      re3L_lfc <- NA_real_; re3L_se <- NA_real_; re3L_pval <- NA_real_
+      tau2_L3 <- NA_real_; tau2_L2 <- NA_real_
+      I2_L3 <- NA_real_; I2_L2 <- NA_real_
+      het_pval <- NA_real_
 
-        # FE Model
-        res_fe <- tryCatch(
-          metafor::rma.mv(yi = yi_val, V = V_exact),
+      # 3LRE Extraction
+      if (!is.null(res_3lre)) {
+        rob_res <- tryCatch(
+          metafor::robust(res_3lre, cluster = val_gse, clubSandwich = TRUE),
           error = function(e) NULL
         )
-
-        # 3LRE Extraction
-        if (!is.null(res_3lre)) {
-          rob_res <- tryCatch(
-            metafor::robust(res_3lre, cluster = val_gse, clubSandwich = TRUE),
-            error = function(e) NULL
-          )
-          if (!is.null(rob_res)) {
-            re3L_lfc_vec[g_idx] <- as.numeric(rob_res$beta)[1]
-            re3L_se_vec[g_idx] <- as.numeric(rob_res$se)[1]
-            re3L_pval_vec[g_idx] <- as.numeric(rob_res$pval)[1]
-          }
-          if (length(res_3lre$sigma2) >= 2) {
-            tau2_L3_vec[g_idx] <- res_3lre$sigma2[1]
-            tau2_L2_vec[g_idx] <- res_3lre$sigma2[2]
-            i2_res <- calculate_pseudo_i2_dropout(vi_val, c(res_3lre$sigma2[1], res_3lre$sigma2[2]))
-            I2_L3_vec[g_idx] <- i2_res[1]
-            I2_L2_vec[g_idx] <- i2_res[2]
-          } else {
-            tau2_L3_vec[g_idx] <- res_3lre$sigma2[1]
-            tau2_L2_vec[g_idx] <- 0
-            i2_res <- calculate_pseudo_i2_dropout(vi_val, c(res_3lre$sigma2[1]))
-            I2_L3_vec[g_idx] <- i2_res[1]
-            I2_L2_vec[g_idx] <- 0
-          }
-          het_pval_vec[g_idx] <- res_3lre$QEp
+        if (!is.null(rob_res)) {
+          re3L_lfc <- as.numeric(rob_res$beta)[1]
+          re3L_se <- as.numeric(rob_res$se)[1]
+          re3L_pval <- as.numeric(rob_res$pval)[1]
+        } else {
+          re3L_lfc <- as.numeric(res_3lre$beta)[1]
+          re3L_se <- as.numeric(res_3lre$se)[1]
+          re3L_pval <- as.numeric(res_3lre$pval)[1]
         }
-
-        # FE Extraction
-        if (!is.null(res_fe)) {
-          fe_lfc_vec[g_idx] <- as.numeric(res_fe$beta)[1]
-          fe_se_vec[g_idx] <- as.numeric(res_fe$se)[1]
-          fe_pval_vec[g_idx] <- res_fe$pval[1]
+        if (length(res_3lre$sigma2) >= 2) {
+          tau2_L3 <- res_3lre$sigma2[1]
+          tau2_L2 <- res_3lre$sigma2[2]
+          i2_res <- calculate_pseudo_i2_dropout(vi_val, c(res_3lre$sigma2[1], res_3lre$sigma2[2]))
+          I2_L3 <- i2_res[1]
+          I2_L2 <- i2_res[2]
+        } else {
+          tau2_L3 <- res_3lre$sigma2[1]
+          tau2_L2 <- 0
+          i2_res <- calculate_pseudo_i2_dropout(vi_val, c(res_3lre$sigma2[1]))
+          I2_L3 <- i2_res[1]
+          I2_L2 <- 0
         }
+        het_pval <- res_3lre$QEp
       }
-      close(pb)
+
+      # FE Extraction
+      fe_lfc <- NA_real_; fe_se <- NA_real_; fe_pval <- NA_real_
+      if (!is.null(res_fe)) {
+        fe_lfc <- as.numeric(res_fe$beta)[1]
+        fe_se <- as.numeric(res_fe$se)[1]
+        fe_pval <- res_fe$pval[1]
+      }
+
+      list(
+        g_idx = g_idx,
+        re3L_lfc = re3L_lfc, re3L_se = re3L_se, re3L_pval = re3L_pval,
+        fe_lfc = fe_lfc, fe_se = fe_se, fe_pval = fe_pval,
+        tau2_L3 = tau2_L3, tau2_L2 = tau2_L2,
+        I2_L3 = I2_L3, I2_L2 = I2_L2,
+        het_pval = het_pval
+      )
+    }
+
+    if (length(genes_to_fit) > 0) {
+      if (!is.null(cl) && num_cores > 1) {
+        # Export combination-specific data to parallel workers
+        parallel::clusterExport(
+          cl,
+          c("all_genes", "valid_mat", "sub_lfc", "sub_se",
+            "comb_comps", "sub_gse_map", "all_cov_mats", "sign_map",
+            "calculate_pseudo_i2_dropout"),
+          envir = environment()
+        )
+        fit_fn <- fit_single_gene
+        environment(fit_fn) <- .GlobalEnv
+        fit_results <- parallel::parLapplyLB(cl, genes_to_fit, fit_fn)
+      } else {
+        pb <- txtProgressBar(min = 0, max = length(genes_to_fit), style = 3)
+        fit_results <- vector("list", length(genes_to_fit))
+        for (step_i in seq_along(genes_to_fit)) {
+          setTxtProgressBar(pb, step_i)
+          fit_results[[step_i]] <- fit_single_gene(genes_to_fit[step_i])
+        }
+        close(pb)
+      }
+
+      # Unpack fit results
+      for (res in fit_results) {
+        g <- res$g_idx
+        re3L_lfc_vec[g]  <- res$re3L_lfc
+        re3L_se_vec[g]   <- res$re3L_se
+        re3L_pval_vec[g] <- res$re3L_pval
+        fe_lfc_vec[g]    <- res$fe_lfc
+        fe_se_vec[g]     <- res$fe_se
+        fe_pval_vec[g]   <- res$fe_pval
+        tau2_L3_vec[g]   <- res$tau2_L3
+        tau2_L2_vec[g]   <- res$tau2_L2
+        I2_L3_vec[g]     <- res$I2_L3
+        I2_L2_vec[g]     <- res$I2_L2
+        het_pval_vec[g]  <- res$het_pval
+      }
     }
 
     # BH FDR adjustments
@@ -382,8 +494,9 @@ run_dropout_test <- function(lfc_matrix,
       stringsAsFactors = FALSE
     )
 
-    cat(sprintf("  ✓ Finished %s: Analyzed %d genes | 3LRE DEGs: %d (Up: %d, Down: %d) | FE DEGs: %d (Up: %d, Down: %d)\n\n",
-                comb_name, n_analyzed, n_3lre_tot, n_3lre_up, n_3lre_down, n_fe_tot, n_fe_up, n_fe_down))
+    comb_elapsed <- round((proc.time() - t_comb_start)["elapsed"], 1)
+    cat(sprintf("  ✓ Finished %s in %.1f s: Analyzed %d genes | 3LRE DEGs: %d (Up: %d, Down: %d) | FE DEGs: %d (Up: %d, Down: %d)\n\n",
+                comb_name, comb_elapsed, n_analyzed, n_3lre_tot, n_3lre_up, n_3lre_down, n_fe_tot, n_fe_up, n_fe_down))
 
     return(summary_row)
   }
@@ -412,6 +525,12 @@ run_dropout_test <- function(lfc_matrix,
   summary_df <- bind_rows(summary_rows)
   summary_file <- file.path(dropout_dir, "dropout_summary.csv")
   write.csv(summary_df, summary_file, row.names = FALSE)
+
+  # Explicitly terminate the parallel worker cluster
+  if (!is.null(cl)) {
+    try(parallel::stopCluster(cl), silent = TRUE)
+    cl <- NULL
+  }
 
   cat(paste(rep("=", 70), collapse = ""), "\n")
   cat("✓ DATASET DROP-OUT TEST COMPLETE!\n")
