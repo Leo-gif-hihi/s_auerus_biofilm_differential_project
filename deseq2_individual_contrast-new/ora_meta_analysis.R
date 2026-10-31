@@ -1,4 +1,4 @@
-run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, cluster_annotation, comparison_gse_map, comparison_control_map = NULL, min_ds, out_dir, ora_padj = 0.05, ora_lfc = 1.0) {
+run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, cluster_annotation, comparison_gse_map, comparison_control_map = NULL, min_ds, out_dir, ora_padj = 0.05, ora_lfc = 1.0, exclude_evidence = c("ND")) {
   cat("\n=== RUNNING OVER-REPRESENTATION META-ANALYSIS ===\n")
 
   # Convert a two-sided p-value to a one-sided p-value testing estimate > 0.
@@ -28,6 +28,18 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
     # --- 2. GAF Parsing and Cluster ID Mapping ---
     # Read the custom GAF file and map dataset cluster IDs to standard gene symbols
     gaf <- read.delim(gaf_file, comment.char = "!", header = FALSE, stringsAsFactors = FALSE, quote = "")
+
+    # Filter GAF annotations (Issue 5):
+    # - Exclude negative qualifiers in V4 (e.g. 'NOT', 'NOT|enables', 'NOT|involved_in')
+    # - Exclude uninformative evidence codes in V7 (e.g. 'ND' = No biological Data available)
+    n_raw <- nrow(gaf)
+    gaf <- gaf[!grepl("(^|\\|)NOT(\\||$)", gaf$V4), ]
+    if (!is.null(exclude_evidence) && length(exclude_evidence) > 0) {
+      gaf <- gaf[!gaf$V7 %in% exclude_evidence, ]
+    }
+    cat(sprintf("  GAF filtering: %d raw -> %d annotations retained (filtered NOT qualifiers; excluded evidence: %s)\n",
+                n_raw, nrow(gaf), if (length(exclude_evidence) > 0) paste(exclude_evidence, collapse = ", ") else "none"))
+
     term2gene <- unique(data.frame(term = gaf$V5, gene = gaf$V3, stringsAsFactors = FALSE))
 
     # The GAF contains only direct annotations. GO is a DAG, so a gene annotated to a
