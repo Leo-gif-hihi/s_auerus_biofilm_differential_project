@@ -134,6 +134,7 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
     ora_se_list <- setNames(lapply(directions, function(x) list()), directions)
     ora_comparisons <- setNames(lapply(directions, function(x) character(0)), directions)
     ora_gse_map <- setNames(lapply(directions, function(x) character(0)), directions)
+    ora_contributing_genes <- setNames(lapply(directions, function(x) list()), directions)
 
     abs_ora_lfc <- abs(ora_lfc)
 
@@ -198,7 +199,16 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
         # artifactual positive logOR values if included with Haldane-Anscombe correction (+0.5).
         if (de_size == 0) next
 
-        a <- as.numeric(table(factor(t2g_u$term[t2g_u$gene %in% de_symbols], levels = valid_terms)))
+        # Record overlapping DE genes contributing to GO terms for this comparison
+        overlap_mask <- t2g_u$gene %in% de_symbols
+        if (any(overlap_mask)) {
+          comp_overlaps <- t2g_u[overlap_mask, c("term", "gene")]
+          comp_overlaps$comparison <- comp_name
+          comp_overlaps$gse <- gse_id
+          ora_contributing_genes[[d]][[comp_name]] <- comp_overlaps
+        }
+
+        a <- as.numeric(table(factor(t2g_u$term[overlap_mask], levels = valid_terms)))
         a_sub <- a[testable]
         b <- de_size - a_sub
         c_val <- bg_num_sub - a_sub
@@ -230,6 +240,8 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
 
     # --- 5. Aggregate Effect Sizes and Meta-Analyze Each Direction ---
     results_by_dir <- list()
+    contrib_by_dir <- list()
+    summary_by_dir <- list()
     debug_printed <- FALSE
 
     for (d in directions) {
@@ -243,6 +255,18 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
       if (length(curr_logor_list) == 0) {
         cat(sprintf("  - No valid ORA results computed for direction '%s'.\n", d))
         next
+      }
+
+      # Pre-aggregate all contributing DE gene overlaps for direction d
+      all_overlaps_d <- if (length(ora_contributing_genes[[d]]) > 0) {
+        do.call(rbind, ora_contributing_genes[[d]])
+      } else {
+        NULL
+      }
+      overlaps_by_term <- if (!is.null(all_overlaps_d) && nrow(all_overlaps_d) > 0) {
+        split(all_overlaps_d, all_overlaps_d$term)
+      } else {
+        list()
       }
 
       all_go_ids <- unique(unlist(lapply(curr_logor_list, names)))
@@ -269,8 +293,31 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
         valid_go <- !is.na(yi_go) & !is.na(vi_go)
         valid_gse_go <- curr_gse_map[valid_go]
         valid_comp_go <- curr_comparisons[valid_go]
+        n_valid_comps <- sum(valid_go)
 
         if (length(unique(valid_gse_go)) >= max(2, min_ds)) {
+          # Extract contributing genes for this GO term across valid comparisons
+          term_sub <- overlaps_by_term[[go_id]]
+          if (!is.null(term_sub) && nrow(term_sub) > 0) {
+            term_sub <- term_sub[term_sub$comparison %in% valid_comp_go, , drop = FALSE]
+          }
+
+          if (!is.null(term_sub) && nrow(term_sub) > 0) {
+            gene_comp_counts <- tapply(term_sub$comparison, term_sub$gene, function(x) length(unique(x)))
+            # Sort by frequency descending, then alphabetically
+            sorted_genes <- names(gene_comp_counts)[order(-gene_comp_counts, names(gene_comp_counts))]
+            sorted_counts <- as.integer(gene_comp_counts[sorted_genes])
+
+            term_gene_count <- length(sorted_genes)
+            term_genes <- paste(sorted_genes, collapse = "/")
+            gene_freq_strs <- sprintf("%s (%d/%d)", sorted_genes, sorted_counts, n_valid_comps)
+            term_genes_freq <- paste(gene_freq_strs, collapse = "; ")
+          } else {
+            term_gene_count <- 0L
+            term_genes <- ""
+            term_genes_freq <- ""
+          }
+
           # Determine clustering for shared controls to assign rho = 0.5
           if (!is.null(comparison_control_map)) {
             valid_control_go <- comparison_control_map[valid_comp_go]
@@ -349,8 +396,11 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
               logOR_FE_estimate = fe_est,
               logOR_FE_SE = fe_se,
               logOR_FE_pval = fe_p,
-              N_comparisons = sum(valid_go),
+              N_comparisons = n_valid_comps,
               N_datasets = length(unique(valid_gse_go)),
+              Gene_Count = term_gene_count,
+              Genes = term_genes,
+              Genes_Frequency = term_genes_freq,
               stringsAsFactors = FALSE
             )
           }
@@ -366,12 +416,13 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
         ora_meta_df$logOR_RE_padj <- p.adjust(ora_meta_df$logOR_RE_pval, method = "BH")
         ora_meta_df$logOR_FE_padj <- p.adjust(ora_meta_df$logOR_FE_pval, method = "BH")
 
-        # Reorder columns to put padj next to pval
+        # Reorder columns to put padj next to pval, followed by gene info
         ora_meta_df <- ora_meta_df[, c(
           "ID", "Ontology", "Description", "Direction",
           "logOR_RE_estimate", "logOR_RE_SE", "logOR_RE_pval", "logOR_RE_padj",
           "logOR_FE_estimate", "logOR_FE_SE", "logOR_FE_pval", "logOR_FE_padj",
-          "N_comparisons", "N_datasets"
+          "N_comparisons", "N_datasets",
+          "Gene_Count", "Genes", "Genes_Frequency"
         )]
 
         ora_meta_df <- ora_meta_df[order(ora_meta_df$logOR_RE_pval, na.last = TRUE), ]
@@ -389,6 +440,96 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
         }
 
         results_by_dir[[d]] <- ora_meta_df
+
+        # --- 7b. Export Detailed Gene Contributions and Gene Pleiotropy Summaries ---
+        if (!is.null(all_overlaps_d) && nrow(all_overlaps_d) > 0) {
+          # Keep only overlaps for terms evaluated in the meta-analysis
+          overlaps_tested <- all_overlaps_d[all_overlaps_d$term %in% ora_meta_df$ID, , drop = FALSE]
+
+          if (nrow(overlaps_tested) > 0) {
+            term_valid_n <- setNames(ora_meta_df$N_comparisons, ora_meta_df$ID)
+            tg_key <- paste(overlaps_tested$term, overlaps_tested$gene, sep = "@@@")
+            tg_splits <- split(overlaps_tested, tg_key)
+
+            contrib_rows <- lapply(tg_splits, function(df_tg) {
+              t_id <- df_tg$term[1]
+              g_id <- df_tg$gene[1]
+              comps <- unique(df_tg$comparison)
+              gses  <- unique(df_tg$gse)
+              n_comps <- length(comps)
+              tot_comps <- if (!is.na(term_valid_n[t_id])) term_valid_n[t_id] else length(curr_comparisons)
+              pct_comps <- round(100 * n_comps / tot_comps, 1)
+
+              data.frame(
+                GO_ID = t_id,
+                Ontology = term2ontology$ontology[match(t_id, term2ontology$term)],
+                Description = term2name$name[match(t_id, term2name$term)],
+                Direction = d,
+                Gene = g_id,
+                N_Comparisons = n_comps,
+                Total_Comparisons = tot_comps,
+                Percent_Comparisons = pct_comps,
+                N_Datasets = length(gses),
+                Comparisons = paste(sort(comps), collapse = "; "),
+                Datasets = paste(sort(gses), collapse = "; "),
+                stringsAsFactors = FALSE
+              )
+            })
+            contrib_df <- do.call(rbind, contrib_rows)
+            contrib_df <- contrib_df[order(contrib_df$GO_ID, -contrib_df$N_Comparisons, contrib_df$Gene), ]
+
+            contrib_file_d <- file.path(out_dir, sprintf("ORA_Meta_Analysis_Gene_Contributions_%s.csv", d))
+            write.csv(contrib_df, contrib_file_d, row.names = FALSE)
+            cat(sprintf("  - Saved Detailed Gene Contributions (%s) to %s\n", d, contrib_file_d))
+
+            if (d == "all") {
+              contrib_file_legacy <- file.path(out_dir, "ORA_Meta_Analysis_Gene_Contributions.csv")
+              write.csv(contrib_df, contrib_file_legacy, row.names = FALSE)
+              cat(sprintf("  - Saved Detailed Gene Contributions (legacy default) to %s\n", contrib_file_legacy))
+            }
+            contrib_by_dir[[d]] <- contrib_df
+
+            # Export gene-level summary across significant terms (padj < report_padj)
+            sig_term_ids <- ora_meta_df$ID[!is.na(ora_meta_df$logOR_RE_padj) & ora_meta_df$logOR_RE_padj < report_padj]
+            sig_overlaps <- overlaps_tested[overlaps_tested$term %in% sig_term_ids, , drop = FALSE]
+
+            if (nrow(sig_overlaps) > 0) {
+              g_splits <- split(sig_overlaps, sig_overlaps$gene)
+              gene_summary_rows <- lapply(g_splits, function(df_g) {
+                g_id <- df_g$gene[1]
+                terms <- unique(df_g$term)
+                term_names <- term2name$name[match(terms, term2name$term)]
+                term_desc <- sprintf("%s (%s)", terms, term_names)
+                comps <- unique(df_g$comparison)
+                gses <- unique(df_g$gse)
+                data.frame(
+                  Gene = g_id,
+                  Direction = d,
+                  N_Significant_Terms = length(terms),
+                  N_Comparisons = length(comps),
+                  N_Datasets = length(gses),
+                  Significant_Terms = paste(term_desc, collapse = "; "),
+                  Comparisons = paste(sort(comps), collapse = "; "),
+                  Datasets = paste(sort(gses), collapse = "; "),
+                  stringsAsFactors = FALSE
+                )
+              })
+              gene_summary_df <- do.call(rbind, gene_summary_rows)
+              gene_summary_df <- gene_summary_df[order(-gene_summary_df$N_Significant_Terms, -gene_summary_df$N_Comparisons, gene_summary_df$Gene), ]
+
+              gene_sum_file_d <- file.path(out_dir, sprintf("ORA_Meta_Analysis_Gene_Summary_%s.csv", d))
+              write.csv(gene_summary_df, gene_sum_file_d, row.names = FALSE)
+              cat(sprintf("  - Saved Gene-Level Summary across significant terms (%s) to %s\n", d, gene_sum_file_d))
+
+              if (d == "all") {
+                gene_sum_file_legacy <- file.path(out_dir, "ORA_Meta_Analysis_Gene_Summary.csv")
+                write.csv(gene_summary_df, gene_sum_file_legacy, row.names = FALSE)
+                cat(sprintf("  - Saved Gene-Level Summary (legacy default) to %s\n", gene_sum_file_legacy))
+              }
+              summary_by_dir[[d]] <- gene_summary_df
+            }
+          }
+        }
 
         # --- 8. Reporting-only semantic clustering (after BH; full table above is unchanged) ---
         clustered <- tryCatch(
@@ -422,6 +563,20 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
       combined_file <- file.path(out_dir, "ORA_Meta_Analysis_Results_combined.csv")
       write.csv(combined_df, combined_file, row.names = FALSE)
       cat(sprintf("  - Saved Combined ORA Meta-Analysis Results across all directions to %s\n", combined_file))
+
+      if (length(contrib_by_dir) > 0) {
+        combined_contrib <- do.call(rbind, contrib_by_dir)
+        combined_contrib_file <- file.path(out_dir, "ORA_Meta_Analysis_Gene_Contributions_combined.csv")
+        write.csv(combined_contrib, combined_contrib_file, row.names = FALSE)
+        cat(sprintf("  - Saved Combined Detailed Gene Contributions across all directions to %s\n", combined_contrib_file))
+      }
+
+      if (length(summary_by_dir) > 0) {
+        combined_summary <- do.call(rbind, summary_by_dir)
+        combined_sum_file <- file.path(out_dir, "ORA_Meta_Analysis_Gene_Summary_combined.csv")
+        write.csv(combined_summary, combined_sum_file, row.names = FALSE)
+        cat(sprintf("  - Saved Combined Gene-Level Summary across all directions to %s\n", combined_sum_file))
+      }
     }
 
     if (length(results_by_dir) == 0) {
