@@ -1,4 +1,4 @@
-run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, cluster_annotation, comparison_gse_map, comparison_control_map = NULL, min_ds, out_dir, ora_padj = 0.05, ora_lfc = 1.0, exclude_evidence = c("ND")) {
+run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, cluster_annotation, comparison_gse_map, comparison_control_map = NULL, min_ds, out_dir, ora_padj = 0.05, ora_lfc = 1.0, exclude_evidence = c("ND"), min_gs_size = 5, max_gs_size = 500) {
   cat("\n=== RUNNING OVER-REPRESENTATION META-ANALYSIS ===\n")
 
   # Convert a two-sided p-value to a one-sided p-value testing estimate > 0.
@@ -67,6 +67,21 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
     })
     names(cluster_id_to_symbol) <- cluster_annotation$cluster_id
 
+    # --- Global Gene-Set Size Filtering (Issue 2) ---
+    # Apply min_gs_size and max_gs_size globally against the study universe
+    # so that the set of tested GO terms is uniform across all comparisons and does not
+    # vary dynamically depending on individual comparison universes.
+    all_genes <- rownames(cts)
+    global_symbols <- unique(cluster_id_to_symbol[all_genes])
+    global_symbols <- global_symbols[!is.na(global_symbols) & global_symbols != ""]
+
+    term2gene_study <- term2gene[term2gene$gene %in% global_symbols, ]
+    term_sizes <- table(term2gene_study$term)
+    valid_terms <- names(term_sizes)[term_sizes >= min_gs_size & term_sizes <= max_gs_size]
+    term2gene <- term2gene_study[term2gene_study$term %in% valid_terms, ]
+    cat(sprintf("  Global gene-set size filtering (%d-%d): %d terms retained across %d study genes\n",
+                min_gs_size, max_gs_size, length(valid_terms), length(global_symbols)))
+
     goterms <- as.data.frame(GO.db::GOTERM)
     term2name <- unique(data.frame(term = goterms$go_id, name = goterms$Term, stringsAsFactors = FALSE))
     term2ontology <- unique(data.frame(term = goterms$go_id, ontology = goterms$Ontology, stringsAsFactors = FALSE))
@@ -123,8 +138,8 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
             universe = universe_symbols,
             pvalueCutoff = 1,
             qvalueCutoff = 1,
-            minGSSize = 5,
-            maxGSSize = 500,
+            minGSSize = 1,
+            maxGSSize = Inf,
             TERM2GENE = term2gene,
             TERM2NAME = term2name
           )
