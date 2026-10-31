@@ -126,45 +126,25 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
         comp_name, length(universe_clusters), length(universe_symbols), length(de_symbols)
       ))
 
-      if (length(de_symbols) == 0) {
-        cat("  - Skipping ORA for", comp_name, "due to 0 mapped DE genes.\n")
-        next
-      }
+      # --- 3b. Build 2x2 tables for ALL globally valid terms ---
+      # enricher() drops terms with zero DE genes, which would turn a = 0 into NA and bias the
+      # meta-analysis upward. Count directly so zero-hit terms get a = 0 (strongly negative logOR).
+      # Terms with no genes in this comparison's universe are untestable and remain NA.
+      t2g_u <- term2gene[term2gene$gene %in% universe_symbols, ]
+      bg_num <- as.numeric(table(factor(t2g_u$term, levels = valid_terms)))
+      a <- as.numeric(table(factor(t2g_u$term[t2g_u$gene %in% de_symbols], levels = valid_terms)))
+      de_size <- length(de_symbols)
+      bg_den <- length(universe_symbols)
+      testable <- bg_num > 0
 
-      ora_res <- tryCatch(
-        {
-          enricher(
-            gene = de_symbols,
-            universe = universe_symbols,
-            pvalueCutoff = 1,
-            qvalueCutoff = 1,
-            minGSSize = 1,
-            maxGSSize = Inf,
-            TERM2GENE = term2gene,
-            TERM2NAME = term2name
-          )
-        },
-        error = function(e) NULL
-      )
-
-      # --- 4. Calculate Log Odds Ratios ---
-      # If ORA returns results, compute the continuous Log Odds Ratio (logOR) and Standard Error (SE)
-      # using the Haldane-Anscombe correction (+0.5) to avoid zeroes
-      if (!is.null(ora_res) && nrow(ora_res@result) > 0) {
-        res_df <- ora_res@result
-
-        parse_num <- function(x) as.numeric(sapply(strsplit(as.character(x), "/"), `[`, 1))
-        parse_den <- function(x) as.numeric(sapply(strsplit(as.character(x), "/"), `[`, 2))
-
-        a <- parse_num(res_df$GeneRatio)
-        de_size <- parse_den(res_df$GeneRatio)
+      if (any(testable)) {
+        a <- a[testable]
+        bg_num <- bg_num[testable]
         b <- de_size - a
-
-        bg_num <- parse_num(res_df$BgRatio)
-        bg_den <- parse_den(res_df$BgRatio)
         c_val <- bg_num - a
         d <- bg_den - de_size - c_val
 
+        # Haldane-Anscombe correction (+0.5)
         a_adj <- a + 0.5
         b_adj <- b + 0.5
         c_adj <- c_val + 0.5
@@ -173,8 +153,8 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
         logOR <- log((a_adj * d_adj) / (b_adj * c_adj))
         se_logOR <- sqrt(1 / a_adj + 1 / b_adj + 1 / c_adj + 1 / d_adj)
 
-        ora_logor_list[[comp_name]] <- setNames(logOR, res_df$ID)
-        ora_se_list[[comp_name]] <- setNames(se_logOR, res_df$ID)
+        ora_logor_list[[comp_name]] <- setNames(logOR, valid_terms[testable])
+        ora_se_list[[comp_name]] <- setNames(se_logOR, valid_terms[testable])
         ora_comparisons <- c(ora_comparisons, comp_name)
         ora_gse_map[comp_name] <- gse_id
       }
