@@ -1,4 +1,43 @@
-run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, cluster_annotation, comparison_gse_map, comparison_control_map = NULL, min_ds, out_dir, ora_padj = 0.05, ora_lfc = 1.0, exclude_evidence = c("ND"), min_gs_size = 5, max_gs_size = 500, directions = c("all", "up", "down")) {
+# Reporting-only redundancy reduction. Called AFTER BH adjustment; it never alters the
+# tested terms or their p-values/padj. Significant terms (padj < sig_padj) are clustered
+# per ontology by GOSemSim (Wang graph-based similarity, hierarchical average linkage,
+# cut at similarity >= sim_cutoff). The most significant term (lowest padj, ties broken
+# by largest estimate) represents each cluster.
+cluster_significant_go_terms <- function(res_df, sig_padj = 0.05, sim_cutoff = 0.7, padj_col = "logOR_RE_padj", est_col = "logOR_RE_estimate", measure = "Wang") {
+  if (!requireNamespace("GOSemSim", quietly = TRUE)) {
+    if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager", repos = "https://cloud.r-project.org")
+    BiocManager::install("GOSemSim", update = FALSE, ask = FALSE)
+  }
+  sig <- res_df[!is.na(res_df[[padj_col]]) & res_df[[padj_col]] < sig_padj, , drop = FALSE]
+  if (nrow(sig) == 0) return(NULL)
+
+  out <- list()
+  for (ont in unique(sig$Ontology)) {
+    sub <- sig[sig$Ontology == ont, , drop = FALSE]
+    sub <- sub[order(sub[[padj_col]], -sub[[est_col]]), , drop = FALSE]
+    if (nrow(sub) == 1) {
+      sub$Cluster <- paste0(ont, "_1")
+      sub$Cluster_Size <- 1L
+      sub$Is_Representative <- TRUE
+      out[[ont]] <- sub
+      next
+    }
+    sem <- GOSemSim::godata(OrgDb = NULL, ont = ont, computeIC = FALSE)
+    sim <- suppressMessages(GOSemSim::mgoSim(sub$ID, sub$ID, semData = sem, measure = measure, combine = NULL))
+    sim[is.na(sim)] <- 0 # obsolete/unmappable terms -> own singleton cluster
+    diag(sim) <- 1
+    hc <- hclust(as.dist(1 - sim), method = "average")
+    cl <- cutree(hc, h = 1 - sim_cutoff)
+    sub$Cluster <- paste0(ont, "_", unname(cl[match(sub$ID, rownames(sim))]))
+    sub$Cluster_Size <- as.integer(table(sub$Cluster)[sub$Cluster])
+    # sub is sorted by significance, so the first term in each cluster is the representative
+    sub$Is_Representative <- !duplicated(sub$Cluster)
+    out[[ont]] <- sub
+  }
+  do.call(rbind, out)
+}
+
+run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, cluster_annotation, comparison_gse_map, comparison_control_map = NULL, min_ds, out_dir, ora_padj = 0.05, ora_lfc = 1.0, exclude_evidence = c("ND"), min_gs_size = 5, max_gs_size = 500, directions = c("all", "up", "down"), sem_sim_cutoff = 0.7, report_padj = 0.05) {
   cat("\n=== RUNNING OVER-REPRESENTATION META-ANALYSIS ===\n")
 
   # Validate directions
@@ -350,6 +389,28 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
         }
 
         results_by_dir[[d]] <- ora_meta_df
+
+        # --- 8. Reporting-only semantic clustering (after BH; full table above is unchanged) ---
+        clustered <- tryCatch(
+          cluster_significant_go_terms(ora_meta_df, sig_padj = report_padj, sim_cutoff = sem_sim_cutoff),
+          error = function(e) {
+            cat(sprintf("  - [%s] GOSemSim clustering failed: %s\n", d, e$message))
+            NULL
+          }
+        )
+        if (!is.null(clustered)) {
+          clustered <- clustered[order(clustered$Ontology, clustered$Cluster, !clustered$Is_Representative, clustered$logOR_RE_padj), ]
+          clusters_file <- file.path(out_dir, sprintf("ORA_Meta_Analysis_Significant_Term_Clusters_%s.csv", d))
+          write.csv(clustered, clusters_file, row.names = FALSE)
+          reps <- clustered[clustered$Is_Representative, ]
+          reps <- reps[order(reps$logOR_RE_padj), ]
+          reps_file <- file.path(out_dir, sprintf("ORA_Meta_Analysis_Representative_Terms_%s.csv", d))
+          write.csv(reps, reps_file, row.names = FALSE)
+          cat(sprintf("  - %d significant terms (padj < %g) -> %d clusters (Wang sim >= %g). Saved clusters to %s and representatives to %s\n",
+                      nrow(clustered), report_padj, nrow(reps), sem_sim_cutoff, clusters_file, reps_file))
+        } else {
+          cat(sprintf("  - [%s] No significant terms (padj < %g) to cluster.\n", d, report_padj))
+        }
       } else {
         cat(sprintf("  - [%s] Not enough valid datasets/comparisons to run meta-analysis on any GO term.\n", d))
       }
