@@ -1,5 +1,10 @@
-run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, cluster_annotation, comparison_gse_map, comparison_control_map = NULL, min_ds, out_dir, ora_padj = 0.05, ora_lfc = 1.0, exclude_evidence = c("ND"), min_gs_size = 5, max_gs_size = 500) {
+run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, cluster_annotation, comparison_gse_map, comparison_control_map = NULL, min_ds, out_dir, ora_padj = 0.05, ora_lfc = 1.0, exclude_evidence = c("ND"), min_gs_size = 5, max_gs_size = 500, directions = c("all", "up", "down")) {
   cat("\n=== RUNNING OVER-REPRESENTATION META-ANALYSIS ===\n")
+
+  # Validate directions
+  directions <- match.arg(directions, c("all", "up", "down"), several.ok = TRUE)
+  directions <- unique(directions)
+  cat(sprintf("Directions to analyze: %s\n", paste(directions, collapse = ", ")))
 
   # Convert a two-sided p-value to a one-sided p-value testing estimate > 0.
   # Positive estimate: halve p. Negative estimate: 1 - p/2 (never significant).
@@ -86,10 +91,12 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
     term2name <- unique(data.frame(term = goterms$go_id, name = goterms$Term, stringsAsFactors = FALSE))
     term2ontology <- unique(data.frame(term = goterms$go_id, ontology = goterms$Ontology, stringsAsFactors = FALSE))
 
-    ora_logor_list <- list()
-    ora_se_list <- list()
-    ora_comparisons <- c()
-    ora_gse_map <- c()
+    ora_logor_list <- setNames(lapply(directions, function(x) list()), directions)
+    ora_se_list <- setNames(lapply(directions, function(x) list()), directions)
+    ora_comparisons <- setNames(lapply(directions, function(x) character(0)), directions)
+    ora_gse_map <- setNames(lapply(directions, function(x) character(0)), directions)
+
+    abs_ora_lfc <- abs(ora_lfc)
 
     # --- 3. Compute ORA for Each Comparison ---
     # Iterate through each dataset contrast to perform dataset-specific over-representation analysis
@@ -112,19 +119,13 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
       if (length(universe_clusters) == 0) next
 
       dataset_padj <- p.adjust(pvals[valid_mask], method = "BH")
-      de_mask <- dataset_padj < ora_padj & abs(lfcs[valid_mask]) >= ora_lfc
-      de_clusters <- universe_clusters[de_mask]
+      abs_lfc <- abs(lfcs[valid_mask])
+      signed_lfc <- lfcs[valid_mask]
 
       universe_symbols <- unique(cluster_id_to_symbol[universe_clusters])
       universe_symbols <- universe_symbols[!is.na(universe_symbols) & universe_symbols != ""]
 
-      de_symbols <- unique(cluster_id_to_symbol[de_clusters])
-      de_symbols <- de_symbols[!is.na(de_symbols) & de_symbols != ""]
-
-      cat(sprintf(
-        "  [%s] Eligible genes: %d | Mapped universe genes: %d | Mapped DE genes for ORA: %d\n",
-        comp_name, length(universe_clusters), length(universe_symbols), length(de_symbols)
-      ))
+      if (length(universe_symbols) == 0) next
 
       # --- 3b. Build 2x2 tables for ALL globally valid terms ---
       # enricher() drops terms with zero DE genes, which would turn a = 0 into NA and bias the
@@ -132,51 +133,93 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
       # Terms with no genes in this comparison's universe are untestable and remain NA.
       t2g_u <- term2gene[term2gene$gene %in% universe_symbols, ]
       bg_num <- as.numeric(table(factor(t2g_u$term, levels = valid_terms)))
-      a <- as.numeric(table(factor(t2g_u$term[t2g_u$gene %in% de_symbols], levels = valid_terms)))
-      de_size <- length(de_symbols)
       bg_den <- length(universe_symbols)
       testable <- bg_num > 0
 
-      if (any(testable)) {
-        a <- a[testable]
-        bg_num <- bg_num[testable]
-        b <- de_size - a
-        c_val <- bg_num - a
-        d <- bg_den - de_size - c_val
+      if (!any(testable)) next
+
+      bg_num_sub <- bg_num[testable]
+      valid_terms_sub <- valid_terms[testable]
+
+      de_counts_log <- list()
+
+      for (d in directions) {
+        de_mask <- switch(d,
+          "all"  = dataset_padj < ora_padj & abs_lfc >= abs_ora_lfc,
+          "up"   = dataset_padj < ora_padj & signed_lfc >= abs_ora_lfc,
+          "down" = dataset_padj < ora_padj & signed_lfc <= -abs_ora_lfc
+        )
+        de_clusters <- universe_clusters[de_mask]
+        de_symbols <- unique(cluster_id_to_symbol[de_clusters])
+        de_symbols <- de_symbols[!is.na(de_symbols) & de_symbols != ""]
+        de_size <- length(de_symbols)
+        de_counts_log[[d]] <- de_size
+
+        # A comparison with 0 DE genes cannot be tested for enrichment and would yield
+        # artifactual positive logOR values if included with Haldane-Anscombe correction (+0.5).
+        if (de_size == 0) next
+
+        a <- as.numeric(table(factor(t2g_u$term[t2g_u$gene %in% de_symbols], levels = valid_terms)))
+        a_sub <- a[testable]
+        b <- de_size - a_sub
+        c_val <- bg_num_sub - a_sub
+        d_val <- bg_den - de_size - c_val
 
         # Haldane-Anscombe correction (+0.5)
-        a_adj <- a + 0.5
+        a_adj <- a_sub + 0.5
         b_adj <- b + 0.5
         c_adj <- c_val + 0.5
-        d_adj <- d + 0.5
+        d_adj <- d_val + 0.5
 
         logOR <- log((a_adj * d_adj) / (b_adj * c_adj))
         se_logOR <- sqrt(1 / a_adj + 1 / b_adj + 1 / c_adj + 1 / d_adj)
 
-        ora_logor_list[[comp_name]] <- setNames(logOR, valid_terms[testable])
-        ora_se_list[[comp_name]] <- setNames(se_logOR, valid_terms[testable])
-        ora_comparisons <- c(ora_comparisons, comp_name)
-        ora_gse_map[comp_name] <- gse_id
+        ora_logor_list[[d]][[comp_name]] <- setNames(logOR, valid_terms_sub)
+        ora_se_list[[d]][[comp_name]] <- setNames(se_logOR, valid_terms_sub)
+        ora_comparisons[[d]] <- c(ora_comparisons[[d]], comp_name)
+        ora_gse_map[[d]][comp_name] <- gse_id
       }
+
+      cat(sprintf(
+        "  [%s] Eligible genes: %d | Mapped universe genes: %d | Mapped DE genes (all: %s, up: %s, down: %s)\n",
+        comp_name, length(universe_clusters), length(universe_symbols),
+        if (!is.null(de_counts_log[["all"]])) as.character(de_counts_log[["all"]]) else "-",
+        if (!is.null(de_counts_log[["up"]])) as.character(de_counts_log[["up"]]) else "-",
+        if (!is.null(de_counts_log[["down"]])) as.character(de_counts_log[["down"]]) else "-"
+      ))
     }
 
-    # --- 5. Aggregate Effect Sizes ---
-    # Combine the logOR and SE from all individual comparisons into master matrices
-    if (length(ora_logor_list) > 0) {
-      all_go_ids <- unique(unlist(lapply(ora_logor_list, names)))
+    # --- 5. Aggregate Effect Sizes and Meta-Analyze Each Direction ---
+    results_by_dir <- list()
+    debug_printed <- FALSE
 
-      ora_yi <- matrix(NA, nrow = length(all_go_ids), ncol = length(ora_logor_list), dimnames = list(all_go_ids, ora_comparisons))
-      ora_vi <- matrix(NA, nrow = length(all_go_ids), ncol = length(ora_se_list), dimnames = list(all_go_ids, ora_comparisons))
+    for (d in directions) {
+      cat(sprintf("\n--- Meta-Analyzing GO Terms for Direction: %s ---\n", toupper(d)))
 
-      for (comp_name in ora_comparisons) {
-        ora_yi[names(ora_logor_list[[comp_name]]), comp_name] <- ora_logor_list[[comp_name]]
-        ora_vi[names(ora_se_list[[comp_name]]), comp_name] <- ora_se_list[[comp_name]]^2
+      curr_logor_list <- ora_logor_list[[d]]
+      curr_se_list <- ora_se_list[[d]]
+      curr_comparisons <- ora_comparisons[[d]]
+      curr_gse_map <- ora_gse_map[[d]]
+
+      if (length(curr_logor_list) == 0) {
+        cat(sprintf("  - No valid ORA results computed for direction '%s'.\n", d))
+        next
       }
 
-      cat("  Meta-analyzing", length(all_go_ids), "GO terms across", length(ora_comparisons), "comparisons...\n")
+      all_go_ids <- unique(unlist(lapply(curr_logor_list, names)))
+
+      ora_yi <- matrix(NA, nrow = length(all_go_ids), ncol = length(curr_logor_list), dimnames = list(all_go_ids, curr_comparisons))
+      ora_vi <- matrix(NA, nrow = length(all_go_ids), ncol = length(curr_se_list), dimnames = list(all_go_ids, curr_comparisons))
+
+      for (comp_name in curr_comparisons) {
+        ora_yi[names(curr_logor_list[[comp_name]]), comp_name] <- curr_logor_list[[comp_name]]
+        ora_vi[names(curr_se_list[[comp_name]]), comp_name] <- curr_se_list[[comp_name]]^2
+      }
+
+      cat(sprintf("  Meta-analyzing %d GO terms across %d comparisons (direction: %s)...\n",
+                  length(all_go_ids), length(curr_comparisons), d))
 
       ora_meta_res <- list()
-      debug_printed <- FALSE
       for (i in seq_along(all_go_ids)) {
         go_id <- all_go_ids[i]
         yi_go <- ora_yi[i, ]
@@ -185,8 +228,8 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
         # --- 6. Meta-Analyze Each GO Term ---
         # Fit 3-Level Random Effects (w/ clubSandwich RVE) and Fixed Effects models
         valid_go <- !is.na(yi_go) & !is.na(vi_go)
-        valid_gse_go <- ora_gse_map[valid_go]
-        valid_comp_go <- ora_comparisons[valid_go]
+        valid_gse_go <- curr_gse_map[valid_go]
+        valid_comp_go <- curr_comparisons[valid_go]
 
         if (length(unique(valid_gse_go)) >= max(2, min_ds)) {
           # Determine clustering for shared controls to assign rho = 0.5
@@ -206,7 +249,7 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
           )
 
           if (!debug_printed) {
-            cat("\n--- DEBUG: Covariance Matrices for GO term", go_id, "---\n")
+            cat(sprintf("\n--- DEBUG: Covariance Matrices for GO term %s (direction: %s) ---\n", go_id, d))
             cat("Comparisons:\n")
             print(valid_comp_go)
             cat("\nClusters (valid_cov_cluster):\n")
@@ -221,7 +264,7 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
           res_re <- tryCatch(
             metafor::rma.mv(yi = yi_go[valid_go], V = V_mat_logor, random = ~ 1 | valid_gse_go / valid_comp_go, method = "REML"),
             error = function(e) {
-              cat(sprintf("  - [logOR] 3-level RE model failed for %s: %s\n", go_id, e$message))
+              cat(sprintf("  - [logOR %s] 3-level RE model failed for %s: %s\n", d, go_id, e$message))
               NULL
             }
           )
@@ -230,7 +273,7 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
             res_re_rob <- tryCatch(
               metafor::robust(res_re, cluster = valid_gse_go, clubSandwich = TRUE),
               error = function(e) {
-                cat(sprintf("  - [logOR] clubSandwich RVE failed for %s (using model SE): %s\n", go_id, e$message))
+                cat(sprintf("  - [logOR %s] clubSandwich RVE failed for %s (using model SE): %s\n", d, go_id, e$message))
                 NULL
               }
             )
@@ -242,7 +285,7 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
           res_fe <- tryCatch(
             metafor::rma.mv(yi = yi_go[valid_go], V = V_mat_logor),
             error = function(e) {
-              cat(sprintf("  - [logOR FE] model failed for %s: %s\n", go_id, e$message))
+              cat(sprintf("  - [logOR FE %s] model failed for %s: %s\n", d, go_id, e$message))
               NULL
             }
           )
@@ -260,6 +303,7 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
               ID = go_id,
               Ontology = term2ontology$ontology[match(go_id, term2ontology$term)],
               Description = term2name$name[match(go_id, term2name$term)],
+              Direction = d,
               logOR_RE_estimate = re_est,
               logOR_RE_SE = re_se,
               logOR_RE_pval = re_p,
@@ -285,21 +329,45 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
 
         # Reorder columns to put padj next to pval
         ora_meta_df <- ora_meta_df[, c(
-          "ID", "Ontology", "Description",
+          "ID", "Ontology", "Description", "Direction",
           "logOR_RE_estimate", "logOR_RE_SE", "logOR_RE_pval", "logOR_RE_padj",
           "logOR_FE_estimate", "logOR_FE_SE", "logOR_FE_pval", "logOR_FE_padj",
           "N_comparisons", "N_datasets"
         )]
 
         ora_meta_df <- ora_meta_df[order(ora_meta_df$logOR_RE_pval, na.last = TRUE), ]
-        write.csv(ora_meta_df, file.path(out_dir, "ORA_Meta_Analysis_Results.csv"), row.names = FALSE)
-        cat("  - Saved ORA Meta-Analysis Results to", file.path(out_dir, "ORA_Meta_Analysis_Results.csv"), "\n")
+
+        # Save direction-specific CSV
+        out_file_d <- file.path(out_dir, sprintf("ORA_Meta_Analysis_Results_%s.csv", d))
+        write.csv(ora_meta_df, out_file_d, row.names = FALSE)
+        cat(sprintf("  - Saved ORA Meta-Analysis Results (%s) to %s\n", d, out_file_d))
+
+        # For "all", also write to standard ORA_Meta_Analysis_Results.csv for backward compatibility
+        if (d == "all") {
+          out_file_legacy <- file.path(out_dir, "ORA_Meta_Analysis_Results.csv")
+          write.csv(ora_meta_df, out_file_legacy, row.names = FALSE)
+          cat(sprintf("  - Saved ORA Meta-Analysis Results (legacy default) to %s\n", out_file_legacy))
+        }
+
+        results_by_dir[[d]] <- ora_meta_df
       } else {
-        cat("  - Not enough valid datasets/comparisons to run meta-analysis on any GO term.\n")
+        cat(sprintf("  - [%s] Not enough valid datasets/comparisons to run meta-analysis on any GO term.\n", d))
       }
-    } else {
-      cat("  - No ORA results could be computed for any comparison.\n")
     }
+
+    # If multiple directions were analyzed, also save a combined CSV table
+    if (length(results_by_dir) > 1) {
+      combined_df <- do.call(rbind, results_by_dir)
+      combined_file <- file.path(out_dir, "ORA_Meta_Analysis_Results_combined.csv")
+      write.csv(combined_df, combined_file, row.names = FALSE)
+      cat(sprintf("  - Saved Combined ORA Meta-Analysis Results across all directions to %s\n", combined_file))
+    }
+
+    if (length(results_by_dir) == 0) {
+      cat("  - No ORA meta-analysis results could be computed for any direction.\n")
+    }
+
+    return(invisible(results_by_dir))
   } else {
     cat("  - GAF file not found or not provided. Skipping ORA meta-analysis.\n")
   }
