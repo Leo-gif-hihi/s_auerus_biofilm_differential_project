@@ -6,9 +6,11 @@ Phase 1 Implementation:
 Parses the Staphylococcus aureus NCTC 8325 operon database (list_of_operons.txt)
 and resolves all gene entities to:
   1. Genome annotation (locus tags 'SAOUHSC_...' and official gene symbols) from GCF_000013425.1.gff
-  2. Study expression ortholog clusters ('cluster_id') via bidirectional matching:
+  2. AureoWiki multi-strain pan-genome annotations (pan gene symbols, synonyms, and SAUPAN ortholog tokens)
+  3. Study expression ortholog clusters ('cluster_id') via multi-method matching:
      - Method 1 (Direct): matching locus tag and gene symbol against All_Genes_Locus_Tags
-     - Method 2 (Ortholog): bridging NCTC 8325 protein IDs (YP_...) via MMseqs2 cluster alignments
+     - Method 2 (AureoWiki Ortholog): bridging via AureoWiki SAUPAN pan-locus groups and pan gene symbols
+     - Method 3 (MMseqs2 Ortholog): bridging NCTC 8325 protein IDs (YP_...) via MMseqs2 cluster alignments
 
 Outputs:
   - operon_gene_mapping.csv : Per-gene annotation and mapping table (2,842 rows)
@@ -17,6 +19,7 @@ Outputs:
 
 import os
 import re
+import glob
 import collections
 import pandas as pd
 
@@ -25,8 +28,7 @@ def main():
     operon_file = os.path.join(base_dir, "list_of_operons.txt")
     gff_file = os.path.join(base_dir, "GCF_000013425.1.gff")
     mmseqs_file = os.path.join(base_dir, "mmseqs2", "cluster_alignments.tsv")
-    deseq2_res_file = os.path.join(base_dir, "results_sample_info-all", "DESeq2_contrast_results.csv")
-    gene_info_excel = os.path.join(base_dir, "annote", "GeneSpecificInformation_NCTC8325.xlsx")
+    annote_dir = os.path.join(base_dir, "annote")
 
     out_gene_mapping = os.path.join(base_dir, "operon_gene_mapping.csv")
     out_operon_summary = os.path.join(base_dir, "operon_summary.csv")
@@ -94,21 +96,51 @@ def main():
                     locus_to_sym[lt] = sym
                     sym_to_locus[sym.lower()].append(lt)
 
-    # Supplement gene symbols and synonyms from GeneSpecificInformation_NCTC8325.xlsx if available
-    if os.path.exists(gene_info_excel):
-        print("  - Supplementing symbols from GeneSpecificInformation_NCTC8325.xlsx...")
-        df_nctc = pd.read_excel(gene_info_excel)
-        for _, row in df_nctc.iterrows():
-            lt = str(row.get("locus tag", "")).strip()
-            sym = str(row.get("symbol", "")).strip()
-            syn = str(row.get("synonym", "")).strip()
-            if lt and lt.startswith("SAOUHSC_"):
-                if sym and sym != "nan" and not sym.startswith("SAOUHSC_"):
-                    if lt not in locus_to_sym or not locus_to_sym[lt] or locus_to_sym[lt] == lt:
-                        locus_to_sym[lt] = sym
-                    sym_to_locus[sym.lower()].append(lt)
-                if syn and syn != "nan":
-                    sym_to_locus[syn.lower()].append(lt)
+    # Step 1b: Supplement symbols and cross-strain orthologs from AureoWiki tables
+    strain_files = sorted(glob.glob(os.path.join(annote_dir, "GeneSpecificInformation_*.xlsx")))
+    pan_lt_to_tokens = collections.defaultdict(set)
+    saouhsc_to_pan_lt = {}
+
+    if strain_files:
+        print(f"  - Supplementing annotations from {len(strain_files)} AureoWiki strain files...")
+        for sf in strain_files:
+            try:
+                df_strain = pd.read_excel(sf)
+            except Exception as e:
+                print(f"    ⚠ Could not read {sf}: {e}")
+                continue
+
+            for _, row in df_strain.iterrows():
+                lt = str(row.get("locus tag", "")).strip()
+                pan_lt = str(row.get("pan locus tag", "")).strip()
+                pan_sym = str(row.get("pan gene symbol", "")).strip()
+                sym = str(row.get("symbol", "")).strip()
+                syn = str(row.get("synonym", "")).strip()
+                valid_pan_lt = pan_lt if (pan_lt and pan_lt != "nan" and pan_lt.startswith("SAUPAN")) else None
+
+                cur_sym = None
+                if pan_sym and pan_sym != "nan" and not pan_sym.startswith("SAOUHSC_") and not pan_sym.startswith("SA_") and not pan_sym.startswith("SAUSA300_"):
+                    cur_sym = pan_sym
+                elif sym and sym != "nan" and not sym.startswith("SAOUHSC_") and not sym.startswith("SA_") and not sym.startswith("SAUSA300_"):
+                    cur_sym = sym
+
+                if lt.startswith("SAOUHSC_"):
+                    if cur_sym and (lt not in locus_to_sym or not locus_to_sym[lt] or locus_to_sym[lt] == lt):
+                        locus_to_sym[lt] = cur_sym
+                        sym_to_locus[cur_sym.lower()].append(lt)
+                    if valid_pan_lt:
+                        saouhsc_to_pan_lt[lt] = valid_pan_lt
+
+                if valid_pan_lt:
+                    if lt and lt != "nan":
+                        pan_lt_to_tokens[valid_pan_lt].add(lt)
+                    if cur_sym:
+                        pan_lt_to_tokens[valid_pan_lt].add(cur_sym)
+                    if syn and syn != "nan":
+                        for s in str(syn).split(";"):
+                            s = s.strip()
+                            if s and not s.startswith("SAOUHSC_") and not s.startswith("SA_") and not s.startswith("SAUSA300_"):
+                                pan_lt_to_tokens[valid_pan_lt].add(s)
 
     # Specific paralog duplicates in DOOR with suffix '_2'
     paralog_fixes = {
@@ -118,26 +150,34 @@ def main():
         "secY_2": ("SAOUHSC_02989", "secY", "YP_501438.1")
     }
 
-    print(f"  ✓ Indexed {len(locus_to_sym)} locus tags and {len(sym_to_locus)} gene symbols from NCTC 8325.")
+    print(f"  ✓ Indexed {len(locus_to_sym)} locus tags and {len(sym_to_locus)} gene symbols from NCTC 8325 + AureoWiki.")
+    print(f"  ✓ Indexed {len(pan_lt_to_tokens)} AureoWiki pan-locus (SAUPAN) orthology groups.")
 
     print("\n=== Step 2: Indexing Study Universe (DESeq2_contrast_results.csv) ===")
-    df_res = pd.read_csv(deseq2_res_file)
-    study_cids = set(df_res["cluster_id"])
-    print(f"  ✓ Total study clusters in meta-analysis: {len(study_cids)}")
+    deseq2_files = sorted(glob.glob(os.path.join(base_dir, "results_*", "DESeq2_contrast_results.csv")))
+    if not deseq2_files:
+        deseq2_files = [os.path.join(base_dir, "results_sample_info-all", "DESeq2_contrast_results.csv")]
 
-    # Index All_Genes_Locus_Tags tokens -> set of cluster_ids
+    study_cids = set()
     token_to_cids = collections.defaultdict(set)
-    for _, row in df_res.iterrows():
-        cid = row["cluster_id"]
-        raw_tags = str(row["All_Genes_Locus_Tags"])
-        rep = str(row.get("Representative_Gene", ""))
-        toks = [t.strip() for t in raw_tags.split("/") if t.strip()]
-        if rep and rep != "nan":
-            toks.extend([t.strip() for t in rep.split("/") if t.strip()])
-        for t in set(toks):
-            token_to_cids[t].add(cid)
-            token_to_cids[t.lower()].add(cid)
 
+    for d_file in deseq2_files:
+        if not os.path.exists(d_file):
+            continue
+        df_res = pd.read_csv(d_file)
+        study_cids.update(df_res["cluster_id"].dropna().astype(str).str.strip())
+        for _, row in df_res.iterrows():
+            cid = str(row["cluster_id"]).strip()
+            raw_tags = str(row.get("All_Genes_Locus_Tags", ""))
+            rep = str(row.get("Representative_Gene", ""))
+            toks = [t.strip() for t in raw_tags.split("/") if t.strip()]
+            if rep and rep != "nan":
+                toks.extend([t.strip() for t in rep.split("/") if t.strip()])
+            for t in set(toks):
+                token_to_cids[t].add(cid)
+                token_to_cids[t.lower()].add(cid)
+
+    print(f"  ✓ Total unique study clusters across results: {len(study_cids)}")
     print(f"  ✓ Indexed {len(token_to_cids)} distinct identifier tokens in All_Genes_Locus_Tags.")
 
     print("\n=== Step 3: Indexing MMseqs2 Ortholog Alignments ===")
@@ -203,7 +243,7 @@ def main():
             clean_sym = sym if (sym and sym != lt) else None
 
             # ----------------------------------------------------
-            # Method 1 (Direct User Request):
+            # Method 1 (Direct Locus & Symbol Matching):
             # Match using locus tag and gene symbol in All_Genes_Locus_Tags
             # ----------------------------------------------------
             m1_cids = set()
@@ -230,6 +270,16 @@ def main():
                     m1_cids.update(c)
                     m1_sources.append("operon_symbol")
 
+            # Match cross-strain ortholog tokens via AureoWiki SAUPAN group
+            if lt and lt in saouhsc_to_pan_lt:
+                pan_id = saouhsc_to_pan_lt[lt]
+                for orth_tok in pan_lt_to_tokens[pan_id]:
+                    if orth_tok in token_to_cids or orth_tok.lower() in token_to_cids:
+                        c = token_to_cids.get(orth_tok, token_to_cids.get(orth_tok.lower(), set()))
+                        m1_cids.update(c)
+                        if "aureowiki_ortholog" not in m1_sources:
+                            m1_sources.append("aureowiki_ortholog")
+
             direct_cid = list(m1_cids)[0] if m1_cids else None
             direct_source = "/".join(m1_sources) if m1_sources else "unmapped"
 
@@ -245,7 +295,7 @@ def main():
 
             # ----------------------------------------------------
             # Combined Consensus Resolution:
-            # Prefer direct locus/symbol match; supplement with ortholog cluster
+            # Prefer direct locus/symbol/AureoWiki match; supplement with MMseqs2
             # ----------------------------------------------------
             if direct_cid:
                 final_cid = direct_cid
@@ -346,12 +396,11 @@ def main():
     print(f"  ├── Polycistronic (>= 2 genes): {(df_op_sum['is_polycistronic']).sum()}")
     print(f"  └── Monocistronic (1 gene):     {(~df_op_sum['is_polycistronic']).sum()}")
     print(f"Total Genes in Operon Database: {len(df_gene_map)}")
-    print(f"  ├── Mapped directly via All_Genes_Locus_Tags (locus+symbol): {(df_gene_map['direct_cluster_id'] != '').sum()} ({(df_gene_map['direct_cluster_id'] != '').sum()/len(df_gene_map)*100:.1f}%)")
-    print(f"  └── Mapped via Full Consensus (Direct + Ortholog):           {(df_gene_map['in_study_universe']).sum()} ({(df_gene_map['in_study_universe']).sum()/len(df_gene_map)*100:.1f}%)")
+    print(f"  ├── Mapped directly via All_Genes_Locus_Tags (locus+symbol+AureoWiki): {(df_gene_map['direct_cluster_id'] != '').sum()} ({(df_gene_map['direct_cluster_id'] != '').sum()/len(df_gene_map)*100:.1f}%)")
+    print(f"  └── Mapped via Full Consensus (Direct + Ortholog):                     {(df_gene_map['in_study_universe']).sum()} ({(df_gene_map['in_study_universe']).sum()/len(df_gene_map)*100:.1f}%)")
     print(f"Study Clusters Covered in DESeq2 Meta-Analysis: {df_gene_map['final_cluster_id'].replace('', pd.NA).dropna().nunique()} / {len(study_cids)} ({df_gene_map['final_cluster_id'].replace('', pd.NA).dropna().nunique()/len(study_cids)*100:.1f}%)")
     print(f"Operons with >= 1 gene in study universe: {(df_op_sum['mapped_study_genes'] >= 1).sum()} / {len(df_op_sum)} ({(df_op_sum['mapped_study_genes'] >= 1).sum()/len(df_op_sum)*100:.1f}%)")
     print(f"Operons with >= 50% genes in study universe: {(df_op_sum['coverage_ratio'] >= 0.5).sum()} / {len(df_op_sum)} ({(df_op_sum['coverage_ratio'] >= 0.5).sum()/len(df_op_sum)*100:.1f}%)")
 
 if __name__ == "__main__":
     main()
-
