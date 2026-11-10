@@ -536,8 +536,15 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
           res_re <- tryCatch(
             metafor::rma.mv(yi = yi_go[valid_go], V = V_mat_logor, random = ~ 1 | valid_gse_go / valid_comp_go, method = "REML"),
             error = function(e) {
-              cat(sprintf("  - [logOR %s] 3-level RE model failed for %s: %s\n", d, go_id, e$message))
-              NULL
+              # Fallback to Nelder-Mead if default nlminb optimizer fails
+              tryCatch(
+                metafor::rma.mv(yi = yi_go[valid_go], V = V_mat_logor, random = ~ 1 | valid_gse_go / valid_comp_go, method = "REML",
+                                control = list(optimizer = "optim", optmethod = "Nelder-Mead")),
+                error = function(e2) {
+                  cat(sprintf("  - [logOR %s] 3-level RE model failed for %s (all optimizers): %s\n", d, go_id, e2$message))
+                  NULL
+                }
+              )
             }
           )
 
@@ -593,7 +600,14 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
 
               res_re_op <- tryCatch(
                 metafor::rma.mv(yi = yi_op[valid_op], V = V_mat_op, random = ~ 1 | valid_gse_op / valid_comp_op, method = "REML"),
-                error = function(e) NULL
+                error = function(e) {
+                  # Fallback to Nelder-Mead if default nlminb optimizer fails
+                  tryCatch(
+                    metafor::rma.mv(yi = yi_op[valid_op], V = V_mat_op, random = ~ 1 | valid_gse_op / valid_comp_op, method = "REML",
+                                    control = list(optimizer = "optim", optmethod = "Nelder-Mead")),
+                    error = function(e2) NULL
+                  )
+                }
               )
               if (!is.null(res_re_op)) {
                 res_re_op_rob <- tryCatch(
@@ -993,4 +1007,205 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
   } else {
     cat("  - GAF file not found or not provided. Skipping ORA meta-analysis.\n")
   }
+}
+
+
+# ======================================================================================
+# ORA on the Fixed-Effect (FE) meta-analysis significant gene lists
+# --------------------------------------------------------------------------------------
+# Complements run_ora_meta_analysis() (per-dataset ORA -> meta-analysis). Here a single ORA
+# is run on the genes called significant by the DESeq2 FE meta-analysis
+# (Meta_FE_padj < ora_padj & |Meta_FE_LFC| > ora_lfc; up/down split by sign).
+# Universe = all clusters with non-null Meta_FE_pval and Meta_FE_LFC (== fe_universe.txt).
+# GAF filtering, GO propagation and global gene-set size filtering mirror the meta-ORA.
+# Test: one-sided hypergeometric (identical to clusterProfiler::enricher's p-value), BH adjusted.
+# A Haldane-Anscombe logOR (+0.5) is added so results are comparable to the meta-ORA estimates.
+# ======================================================================================
+run_fe_ora <- function(res_df, gaf_file, cluster_annotation, out_dir, ora_padj = 0.05, ora_lfc = 0.5, exclude_evidence = c("ND"), min_gs_size = 5, max_gs_size = 500, directions = c("all", "up", "down"), sem_sim_cutoff = 0.7, report_padj = 0.05, operon_mapping_file = "operon_gene_mapping.csv", operon_de_threshold = 0.5, meta_results_by_dir = NULL) {
+  cat("\n=== RUNNING ORA ON FE-SIGNIFICANT GENES ===\n")
+  if (is.null(gaf_file) || !file.exists(gaf_file)) {
+    cat("  - GAF file not found or not provided. Skipping FE ORA.\n")
+    return(invisible(NULL))
+  }
+  directions <- unique(match.arg(directions, c("all", "up", "down"), several.ok = TRUE))
+  for (pkg in c("clusterProfiler", "GO.db")) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager", repos = "https://cloud.r-project.org")
+      BiocManager::install(pkg, update = FALSE, ask = FALSE)
+    }
+  }
+  suppressPackageStartupMessages(library(clusterProfiler))
+  suppressPackageStartupMessages(library(GO.db))
+
+  # --- GAF parsing / filtering / propagation (same as meta-ORA) ---
+  gaf <- read.delim(gaf_file, comment.char = "!", header = FALSE, stringsAsFactors = FALSE, quote = "")
+  gaf <- gaf[!grepl("(^|\\|)NOT(\\||$)", gaf$V4), ]
+  if (!is.null(exclude_evidence) && length(exclude_evidence) > 0) gaf <- gaf[!gaf$V7 %in% exclude_evidence, ]
+  term2gene <- unique(data.frame(term = gaf$V5, gene = gaf$V3, stringsAsFactors = FALSE))
+  term2gene <- clusterProfiler::buildGOmap(term2gene)
+  term2gene <- unique(data.frame(term = as.character(term2gene[[1]]), gene = as.character(term2gene[[2]]), stringsAsFactors = FALSE))
+  term2gene <- term2gene[grepl("^GO:", term2gene$term) & !term2gene$term %in% c("GO:0008150", "GO:0003674", "GO:0005575"), ]
+  annotated_genes <- unique(gaf$V3)
+
+  cluster_id_to_symbol <- sapply(cluster_annotation$All_Genes_Locus_Tags, function(tags) {
+    if (is.na(tags) || tags == "") return(NA_character_)
+    m <- strsplit(as.character(tags), "/")[[1]]
+    m <- m[m %in% annotated_genes]
+    if (length(m) > 0) m[1] else NA_character_
+  })
+  names(cluster_id_to_symbol) <- cluster_annotation$cluster_id
+
+  # --- FE universe and DE sets ---
+  if (!"cluster_id" %in% colnames(res_df)) res_df$cluster_id <- rownames(res_df)
+  res_df <- res_df[!is.na(res_df$Meta_FE_pval) & !is.na(res_df$Meta_FE_LFC), , drop = FALSE]
+  universe_clusters <- as.character(res_df$cluster_id)
+  universe_symbols <- unique(cluster_id_to_symbol[universe_clusters])
+  universe_symbols <- universe_symbols[!is.na(universe_symbols) & universe_symbols != ""]
+  cat(sprintf("  FE universe: %d clusters -> %d mapped GAF genes\n", length(universe_clusters), length(universe_symbols)))
+  if (length(universe_symbols) == 0) return(invisible(NULL))
+
+  # Global gene-set size filter against the study universe (as in meta-ORA)
+  t2g_u <- term2gene[term2gene$gene %in% universe_symbols, ]
+  sizes <- table(t2g_u$term)
+  valid_terms <- names(sizes)[sizes >= min_gs_size & sizes <= max_gs_size]
+  t2g_u <- t2g_u[t2g_u$term %in% valid_terms, ]
+  N <- length(universe_symbols)
+  K <- as.numeric(table(factor(t2g_u$term, levels = valid_terms)))
+
+  goterms <- as.data.frame(GO.db::GOTERM)
+  term2name <- unique(data.frame(term = goterms$go_id, name = goterms$Term, stringsAsFactors = FALSE))
+  term2ontology <- unique(data.frame(term = goterms$go_id, ontology = goterms$Ontology, stringsAsFactors = FALSE))
+
+  # --- Operon setup (measured-universe, Option B) ---
+  operon_enabled <- FALSE
+  if (!is.null(operon_mapping_file) && file.exists(operon_mapping_file)) {
+    op_map <- tryCatch(read.csv(operon_mapping_file, stringsAsFactors = FALSE), error = function(e) NULL)
+    if (!is.null(op_map) && all(c("final_cluster_id", "operon_id") %in% colnames(op_map))) {
+      valid_op <- op_map[!is.na(op_map$final_cluster_id) & op_map$final_cluster_id != "", ]
+      if (nrow(valid_op) > 0) {
+        operon_enabled <- TRUE
+        op_to_cids <- lapply(split(valid_op$final_cluster_id, valid_op$operon_id), unique)
+        cid_to_ops <- lapply(split(valid_op$operon_id, valid_op$final_cluster_id), unique)
+        for (u_cid in setdiff(universe_clusters, names(cid_to_ops))) {
+          fid <- paste0("Singleton_", u_cid)
+          op_to_cids[[fid]] <- u_cid
+          cid_to_ops[[u_cid]] <- fid
+        }
+        op_labels <- sapply(names(op_to_cids), function(oid) {
+          syms <- valid_op$gene_symbol[valid_op$operon_id == oid]
+          syms <- unique(syms[!is.na(syms) & syms != ""])
+          if (length(syms) > 0) paste0("Operon_", oid, " (", paste(syms, collapse = "/"), ")") else if (startsWith(oid, "Singleton_")) oid else paste0("Operon_", oid)
+        })
+        gene_to_terms <- split(t2g_u$term, t2g_u$gene)
+        op_to_terms <- lapply(op_to_cids, function(cids) {
+          syms <- unique(cluster_id_to_symbol[intersect(cids, universe_clusters)])
+          unique(unlist(gene_to_terms[syms[!is.na(syms)]]))
+        })
+        term_to_ops <- lapply(split(rep(names(op_to_terms), lengths(op_to_terms)), unlist(op_to_terms, use.names = FALSE)), unique)
+        op_meas <- sapply(op_to_cids, function(cids) sum(cids %in% universe_clusters))
+        valid_comp_ops <- names(op_to_cids)[op_meas > 0]
+        bg_op_num <- sapply(valid_terms, function(t) { o <- term_to_ops[[t]]; if (is.null(o)) 0L else sum(valid_comp_ops %in% o) })
+      }
+    }
+  }
+
+  hg_table <- function(a, de_n, K_vec, N_tot) {
+    b <- de_n - a; cc <- K_vec - a; dd <- N_tot - de_n - cc
+    p <- phyper(a - 1, K_vec, N_tot - K_vec, de_n, lower.tail = FALSE)
+    lor <- log(((a + 0.5) * (dd + 0.5)) / ((b + 0.5) * (cc + 0.5)))
+    se <- sqrt(1 / (a + 0.5) + 1 / (b + 0.5) + 1 / (cc + 0.5) + 1 / (dd + 0.5))
+    list(p = p, lor = lor, se = se, fold = (a / de_n) / (K_vec / N_tot))
+  }
+
+  results_by_dir <- list()
+  for (d in directions) {
+    sig <- res_df$Meta_FE_padj < ora_padj & switch(d,
+      all = abs(res_df$Meta_FE_LFC) > ora_lfc,
+      up = res_df$Meta_FE_LFC > ora_lfc,
+      down = res_df$Meta_FE_LFC < -ora_lfc)
+    sig[is.na(sig)] <- FALSE
+    de_clusters <- as.character(res_df$cluster_id[sig])
+    de_symbols <- unique(cluster_id_to_symbol[de_clusters])
+    de_symbols <- de_symbols[!is.na(de_symbols) & de_symbols != ""]
+    de_n <- length(de_symbols)
+    cat(sprintf("  [%s] FE-significant clusters: %d | mapped DE genes: %d\n", d, length(de_clusters), de_n))
+    if (de_n == 0) next
+
+    ov <- t2g_u[t2g_u$gene %in% de_symbols, ]
+    a <- as.numeric(table(factor(ov$term, levels = valid_terms)))
+    keep <- K > 0
+    h <- hg_table(a, de_n, K, N)
+    df <- data.frame(
+      ID = valid_terms, Ontology = term2ontology$ontology[match(valid_terms, term2ontology$term)],
+      Description = term2name$name[match(valid_terms, term2name$term)], Direction = d,
+      Gene_Count = a, Term_Size = K, DE_Size = de_n, Universe_Size = N,
+      Fold_Enrichment = h$fold, logOR_estimate = h$lor, logOR_SE = h$se, pval = h$p,
+      stringsAsFactors = FALSE
+    )[keep, ]
+    df$padj <- p.adjust(df$pval, method = "BH")
+    ov_genes <- split(ov$gene, ov$term)
+    df$Genes <- sapply(df$ID, function(t) paste(sort(unique(ov_genes[[t]])), collapse = "/"))
+
+    if (operon_enabled) {
+      de_ops_all <- valid_comp_ops[sapply(valid_comp_ops, function(o) sum(op_to_cids[[o]] %in% de_clusters) / op_meas[[o]]) >= operon_de_threshold]
+      de_op_n <- length(de_ops_all); tot_ops <- length(valid_comp_ops)
+      if (de_op_n > 0) {
+        a_op <- sapply(valid_terms, function(t) { o <- term_to_ops[[t]]; if (is.null(o)) 0L else sum(de_ops_all %in% o) })
+        ho <- hg_table(a_op, de_op_n, bg_op_num, tot_ops)
+        df$Operon_Count <- a_op[keep]; df$Operon_Term_Size <- bg_op_num[keep]
+        df$Operon_logOR_estimate <- ho$lor[keep]; df$Operon_logOR_SE <- ho$se[keep]
+        df$Operon_pval <- ho$p[keep]; df$Operon_padj <- p.adjust(df$Operon_pval, method = "BH")
+        df$Operons <- sapply(df$ID, function(t) { o <- intersect(de_ops_all, term_to_ops[[t]]); paste(unname(op_labels[o]), collapse = "; ") })
+        gs <- !is.na(df$padj) & df$padj < report_padj & df$logOR_estimate > 0
+        os <- !is.na(df$Operon_padj) & df$Operon_padj < report_padj & df$Operon_logOR_estimate > 0
+        df$Operon_Inflation_Flag <- ifelse(gs & os, "Robust (Gene+Operon Confirmed)",
+          ifelse(gs & !os, ifelse(df$Operon_Count <= 2, "Operon-Driven Inflation (Single/Few Operon)", "Operon-Attenuated (Broadly Dispersed)"),
+            ifelse(!gs & os, "Operon-Emergent", "Not Significant")))
+      }
+    }
+    df <- df[order(df$pval), ]
+    f <- file.path(out_dir, sprintf("FE_ORA_Results_%s.csv", d))
+    write.csv(df, f, row.names = FALSE)
+    cat(sprintf("  - Saved FE ORA results (%s): %d terms tested, %d significant (padj < %g) -> %s\n", d, nrow(df), sum(df$padj < report_padj & df$logOR_estimate > 0, na.rm = TRUE), report_padj, f))
+    results_by_dir[[d]] <- df
+
+    # Reporting-only semantic clustering (enriched terms only)
+    tmp <- df; tmp$logOR_RE_padj <- ifelse(tmp$logOR_estimate > 0, tmp$padj, NA_real_); tmp$logOR_RE_estimate <- tmp$logOR_estimate
+    clustered <- tryCatch(cluster_significant_go_terms(tmp, sig_padj = report_padj, sim_cutoff = sem_sim_cutoff),
+      error = function(e) { cat(sprintf("  - [%s] GOSemSim clustering failed: %s\n", d, e$message)); NULL })
+    if (!is.null(clustered)) {
+      clustered <- clustered[order(clustered$Ontology, clustered$Cluster, !clustered$Is_Representative, clustered$padj), ]
+      write.csv(clustered, file.path(out_dir, sprintf("FE_ORA_Significant_Term_Clusters_%s.csv", d)), row.names = FALSE)
+      write.csv(clustered[clustered$Is_Representative, ][order(clustered$padj[clustered$Is_Representative]), ],
+        file.path(out_dir, sprintf("FE_ORA_Representative_Terms_%s.csv", d)), row.names = FALSE)
+    }
+  }
+
+  # --- Side-by-side comparison with meta-ORA ---
+  if (!is.null(meta_results_by_dir) && length(results_by_dir) > 0) {
+    cmp <- list()
+    for (d in names(results_by_dir)) {
+      fe <- results_by_dir[[d]]; me <- meta_results_by_dir[[d]]
+      if (is.null(me)) next
+      all_ids <- union(fe$ID, me$ID)
+      m <- data.frame(ID = all_ids, Direction = d, stringsAsFactors = FALSE)
+      m$Description <- c(fe$Description, me$Description)[match(all_ids, c(fe$ID, me$ID))]
+      m$Ontology <- c(fe$Ontology, me$Ontology)[match(all_ids, c(fe$ID, me$ID))]
+      i <- match(all_ids, fe$ID); j <- match(all_ids, me$ID)
+      m$FE_ORA_logOR <- fe$logOR_estimate[i]; m$FE_ORA_padj <- fe$padj[i]
+      m$MetaORA_RE_logOR <- me$logOR_RE_estimate[j]; m$MetaORA_RE_padj <- me$logOR_RE_padj[j]
+      m$MetaORA_FE_logOR <- me$logOR_FE_estimate[j]; m$MetaORA_FE_padj <- me$logOR_FE_padj[j]
+      sf <- !is.na(m$FE_ORA_padj) & m$FE_ORA_padj < report_padj & m$FE_ORA_logOR > 0
+      sm <- !is.na(m$MetaORA_RE_padj) & m$MetaORA_RE_padj < report_padj & m$MetaORA_RE_logOR > 0
+      m$Concordance <- ifelse(sf & sm, "Both", ifelse(sf, "FE_ORA_only", ifelse(sm, "MetaORA_only", "Neither")))
+      cmp[[d]] <- m[order(m$Concordance, m$FE_ORA_padj), ]
+      cat(sprintf("  [%s] significant terms: Both=%d | FE_ORA only=%d | Meta-ORA only=%d\n", d, sum(sf & sm), sum(sf & !sm), sum(sm & !sf)))
+    }
+    if (length(cmp) > 0) {
+      cmp_df <- do.call(rbind, cmp)
+      write.csv(cmp_df, file.path(out_dir, "FE_vs_Meta_ORA_Comparison.csv"), row.names = FALSE)
+      cat("  - Saved FE_vs_Meta_ORA_Comparison.csv\n")
+    }
+  }
+  invisible(results_by_dir)
 }

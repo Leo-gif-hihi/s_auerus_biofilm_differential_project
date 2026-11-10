@@ -17,11 +17,11 @@ library(optparse)
 
 option_list <- list(
   make_option(c("-s", "--sample_dir"),
-    type = "character", default = "sample_info-all",
+    type = "character", default = "sample_info-planktonic-to-planktonic",
     help = "Directory containing sample info files [default= %default]", metavar = "character"
   ),
   make_option(c("-m", "--min_datasets"),
-    type = "integer", default = 0,
+    type = "integer", default = 12,
     help = "Minimum number of datasets a gene must appear in to be analyzed. 0 means all datasets. [default= %default]", metavar = "integer"
   ),
   make_option(c("--use_cwb"),
@@ -1659,7 +1659,7 @@ if (run_dropout_flag) {
 
   # --- TopGO / ORA Meta-Analysis ---
   source("ora_meta_analysis.R")
-  run_ora_meta_analysis(
+  meta_ora_results <- run_ora_meta_analysis(
     gaf_file = opt$gaf_file,
     lfc_list = lfc_list,
     pval_list = pval_list,
@@ -1672,6 +1672,17 @@ if (run_dropout_flag) {
     out_dir = out_dir,
     ora_padj = opt$ora_padj,
     ora_lfc = opt$ora_lfc
+  )
+
+  # --- ORA on FE-significant genes (complements per-dataset ORA + meta-analysis) ---
+  run_fe_ora(
+    res_df = res_df_export,
+    gaf_file = opt$gaf_file,
+    cluster_annotation = cluster_annotation,
+    out_dir = out_dir,
+    ora_padj = opt$ora_padj,
+    ora_lfc = opt$ora_lfc,
+    meta_results_by_dir = meta_ora_results
   )
 
   # --- Gene-Pair Concordance Meta-Analysis ---
