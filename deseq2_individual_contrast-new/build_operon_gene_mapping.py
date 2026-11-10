@@ -22,6 +22,7 @@ import re
 import glob
 import collections
 import pandas as pd
+import networkx as nx
 
 def main():
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -330,8 +331,65 @@ def main():
             })
 
     df_gene_map = pd.DataFrame(operon_records)
+
+    # ----------------------------------------------------
+    # Step 4b: Alternative 4 - Operon Family Merging
+    # Whenever >= 2 DOOR operons share an expression cluster (paralogs, duplicates),
+    # merge them into a single non-redundant operon family unit.
+    # ----------------------------------------------------
+    print("\n=== Step 4b: Merging Multi-Operon Clusters into Non-Redundant Operon Families (Alt 4) ===")
+    G = nx.Graph()
+    for oid in df_gene_map["operon_id"].unique():
+        G.add_node(oid)
+
+    valid_cids = df_gene_map[df_gene_map["final_cluster_id"].notna() & (df_gene_map["final_cluster_id"] != "")]
+    for cid, grp in valid_cids.groupby("final_cluster_id"):
+        oids = grp["operon_id"].unique()
+        if len(oids) > 1:
+            for i in range(len(oids)):
+                for j in range(i + 1, len(oids)):
+                    G.add_edge(oids[i], oids[j])
+
+    components = sorted(list(nx.connected_components(G)), key=lambda c: min(c))
+    multi_count = sum(1 for c in components if len(c) > 1)
+    print(f"  Identified {multi_count} multi-operon family components across {len(G.nodes)} original operons.")
+    print(f"  Total non-redundant operon units after merging: {len(components)}")
+
+    comp_map = {}
+    is_merged_map = {}
+    orig_ops_map = {}
+
+    for comp in components:
+        sorted_oids = sorted(list(comp))
+        if len(sorted_oids) == 1:
+            m_id = str(sorted_oids[0])
+            is_m = False
+            o_str = str(sorted_oids[0])
+        else:
+            m_id = "_".join(str(o) for o in sorted_oids)
+            is_m = True
+            o_str = "/".join(str(o) for o in sorted_oids)
+        for o in sorted_oids:
+            comp_map[o] = m_id
+            is_merged_map[o] = is_m
+            orig_ops_map[o] = o_str
+
+    df_gene_map["original_operon_id"] = df_gene_map["operon_id"]
+    df_gene_map["operon_id"] = df_gene_map["original_operon_id"].map(comp_map)
+    df_gene_map["is_merged_operon"] = df_gene_map["original_operon_id"].map(is_merged_map)
+    df_gene_map["original_operon_ids"] = df_gene_map["original_operon_id"].map(orig_ops_map)
+
+    # Reorder columns
+    cols = [
+        "operon_id", "original_operon_id", "is_merged_operon", "original_operon_ids",
+        "operon_gene_id", "gene_type", "locus_tag", "gene_symbol", "protein_id",
+        "pos_left", "pos_right", "strand", "cog_id", "function",
+        "direct_cluster_id", "direct_match_source", "ortholog_cluster_id",
+        "final_cluster_id", "final_match_source", "in_study_universe"
+    ]
+    df_gene_map = df_gene_map[cols]
     df_gene_map.to_csv(out_gene_mapping, index=False)
-    print(f"  ✓ Exported detailed gene mapping to: {out_gene_mapping}")
+    print(f"  ✓ Exported detailed non-redundant gene mapping to: {out_gene_mapping}")
 
     # ----------------------------------------------------
     # Step 5: Build Operon-Level Summary Table
@@ -339,20 +397,26 @@ def main():
     print("\n=== Step 5: Generating Operon Architecture Summary ===")
     operon_summaries = []
 
-    for op_id, grp in df_gene_map.groupby("operon_id"):
+    for op_id, grp in df_gene_map.groupby("operon_id", sort=False):
         tot_genes = len(grp)
         mapped_grp = grp[grp["in_study_universe"] & (grp["final_cluster_id"] != "")]
         mapped_genes_count = len(mapped_grp)
         mapped_cids = sorted(list(set(mapped_grp["final_cluster_id"])))
 
-        symbols = [s for s in grp["gene_symbol"] if s]
+        symbols = [s for s in grp["gene_symbol"] if s and s != "-"]
+        unique_symbols = list(dict.fromkeys(symbols))
+
         locus_tags = [lt for lt in grp["locus_tag"] if lt]
+        unique_locus_tags = list(dict.fromkeys(locus_tags))
+
+        is_merged = grp["is_merged_operon"].iloc[0]
+        orig_ops = grp["original_operon_ids"].iloc[0]
 
         # Operon representative label
-        if symbols:
-            op_label = f"Operon_{op_id} ({'/'.join(symbols[:4])}{'...' if len(symbols)>4 else ''})"
-        elif locus_tags:
-            op_label = f"Operon_{op_id} ({'/'.join(locus_tags[:3])}{'...' if len(locus_tags)>3 else ''})"
+        if unique_symbols:
+            op_label = f"Operon_{op_id} ({'/'.join(unique_symbols[:4])}{'...' if len(unique_symbols)>4 else ''})"
+        elif unique_locus_tags:
+            op_label = f"Operon_{op_id} ({'/'.join(unique_locus_tags[:3])}{'...' if len(unique_locus_tags)>3 else ''})"
         else:
             op_label = f"Operon_{op_id}"
 
@@ -363,12 +427,15 @@ def main():
         funcs = [f for f in grp["function"] if f and f != "NA"]
         prim_func = funcs[0] if funcs else "Uncharacterized"
 
-        strand = grp["strand"].iloc[0]
+        strands = grp["strand"].dropna().unique()
+        strand = strands[0] if len(strands) == 1 else "mixed"
         pos_min = grp["pos_left"].min()
         pos_max = grp["pos_right"].max()
 
         operon_summaries.append({
             "operon_id": op_id,
+            "original_operon_ids": orig_ops,
+            "is_merged_operon": is_merged,
             "operon_label": op_label,
             "strand": strand,
             "pos_left": pos_min,
@@ -380,21 +447,23 @@ def main():
             "coverage_ratio": round(mapped_genes_count / tot_genes, 4),
             "study_clusters_count": len(mapped_cids),
             "study_cluster_ids": "/".join(mapped_cids),
-            "gene_symbols": "/".join(symbols),
-            "locus_tags": "/".join(locus_tags),
+            "gene_symbols": "/".join(unique_symbols),
+            "locus_tags": "/".join(unique_locus_tags),
             "dominant_cog": dom_cog,
             "primary_function": prim_func
         })
 
+    operon_summaries.sort(key=lambda x: int(str(x["operon_id"]).split("_")[0]))
     df_op_sum = pd.DataFrame(operon_summaries)
     df_op_sum.to_csv(out_operon_summary, index=False)
-    print(f"  ✓ Exported operon summary to: {out_operon_summary}")
+    print(f"  ✓ Exported non-redundant operon summary to: {out_operon_summary}")
 
     # Summary Statistics
     print("\n=== Phase 1 Completion Statistics ===")
-    print(f"Total Operons: {len(df_op_sum)}")
-    print(f"  ├── Polycistronic (>= 2 genes): {(df_op_sum['is_polycistronic']).sum()}")
-    print(f"  └── Monocistronic (1 gene):     {(~df_op_sum['is_polycistronic']).sum()}")
+    print(f"Original DOOR Operons: {len(G.nodes)}")
+    print(f"Non-Redundant Operon Units: {len(df_op_sum)}")
+    print(f"  ├── Single Unmerged Operons: {(~df_op_sum['is_merged_operon']).sum()}")
+    print(f"  └── Multi-Operon Merged Families: {(df_op_sum['is_merged_operon']).sum()}")
     print(f"Total Genes in Operon Database: {len(df_gene_map)}")
     print(f"  ├── Mapped directly via All_Genes_Locus_Tags (locus+symbol+AureoWiki): {(df_gene_map['direct_cluster_id'] != '').sum()} ({(df_gene_map['direct_cluster_id'] != '').sum()/len(df_gene_map)*100:.1f}%)")
     print(f"  └── Mapped via Full Consensus (Direct + Ortholog):                     {(df_gene_map['in_study_universe']).sum()} ({(df_gene_map['in_study_universe']).sum()/len(df_gene_map)*100:.1f}%)")
