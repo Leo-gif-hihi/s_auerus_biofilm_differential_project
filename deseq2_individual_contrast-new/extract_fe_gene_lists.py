@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Extract Fixed Effect (FE) Model Gene Universe and Significant Gene Lists.
+Extract Fixed Effect (FE) Model Gene Universe and Significant / Direction-Specific Gene Lists.
 
 This utility script processes DESeq2 contrast result directories (e.g. results_sample_info-*)
 and extracts gene identifiers for:
@@ -8,13 +8,18 @@ and extracts gene identifiers for:
      p-values and log2 fold-change values (Meta_FE_pval & Meta_FE_LFC).
   2. The "Significant FE" genes: clusters meeting user-defined significance thresholds:
      Meta_FE_padj < padj_threshold and |Meta_FE_LFC| > lfc_threshold.
+  3. The "Upregulated FE" genes: clusters meeting significance thresholds with:
+     Meta_FE_padj < padj_threshold and Meta_FE_LFC > lfc_threshold.
+  4. The "Downregulated FE" genes: clusters meeting significance thresholds with:
+     Meta_FE_padj < padj_threshold and Meta_FE_LFC < -lfc_threshold.
 
 For each category, it extracts:
   - The cluster identifier (`cluster_id`)
   - All locus tags and gene symbols inside `All_Genes_Locus_Tags` (delimited by '/')
 
 Outputs are deduplicated, alphabetically sorted, and written one identifier per line into
-plain text files inside each target results folder (default: fe_universe.txt & fe_significant.txt).
+plain text files inside each target results folder (default: fe_universe.txt, fe_significant.txt,
+fe_upregulated.txt, and fe_downregulated.txt).
 """
 
 import os
@@ -64,11 +69,13 @@ def process_results_directory(
     padj_threshold: float = 0.05,
     lfc_threshold: float = 0.5,
     universe_out_name: str = "fe_universe.txt",
-    sig_out_name: str = "fe_significant.txt"
+    sig_out_name: str = "fe_significant.txt",
+    up_out_name: str = "fe_upregulated.txt",
+    down_out_name: str = "fe_downregulated.txt"
 ) -> bool:
     """
     Process a single results directory containing DESeq2_contrast_results.csv.
-    Generates universe and significant gene ID text files.
+    Generates universe, significant, upregulated, and downregulated gene ID text files.
     """
     csv_path = os.path.join(target_dir, "DESeq2_contrast_results.csv")
     if not os.path.isfile(csv_path):
@@ -104,9 +111,21 @@ def process_results_directory(
     sig_df = df[sig_mask]
     sig_ids = extract_identifiers_from_df(sig_df)
 
+    # 3. Upregulated filter: padj < padj_threshold and LFC > lfc_threshold
+    up_mask = valid_universe_mask & (df["Meta_FE_padj"] < padj_threshold) & (df["Meta_FE_LFC"] > lfc_threshold)
+    up_df = df[up_mask]
+    up_ids = extract_identifiers_from_df(up_df)
+
+    # 4. Downregulated filter: padj < padj_threshold and LFC < -lfc_threshold
+    down_mask = valid_universe_mask & (df["Meta_FE_padj"] < padj_threshold) & (df["Meta_FE_LFC"] < -lfc_threshold)
+    down_df = df[down_mask]
+    down_ids = extract_identifiers_from_df(down_df)
+
     # Output file paths
     universe_path = os.path.join(target_dir, universe_out_name)
     sig_path = os.path.join(target_dir, sig_out_name)
+    up_path = os.path.join(target_dir, up_out_name)
+    down_path = os.path.join(target_dir, down_out_name)
 
     # Write files
     try:
@@ -117,23 +136,35 @@ def process_results_directory(
         with open(sig_path, "w", encoding="utf-8") as f:
             for gene_id in sig_ids:
                 f.write(f"{gene_id}\n")
+
+        with open(up_path, "w", encoding="utf-8") as f:
+            for gene_id in up_ids:
+                f.write(f"{gene_id}\n")
+
+        with open(down_path, "w", encoding="utf-8") as f:
+            for gene_id in down_ids:
+                f.write(f"{gene_id}\n")
     except Exception as e:
         print(f"[-] Error writing output files: {e}", file=sys.stderr)
         return False
 
     # Print summary
-    print(f"  Total clusters in CSV:           {total_rows}")
-    print(f"  Fixed Effect valid clusters:     {len(universe_df)}")
-    print(f"  [+] Universe unique IDs written: {len(universe_ids):<6} -> {universe_out_name}")
-    print(f"  Fixed Effect significant clusters: {len(sig_df)} (padj < {padj_threshold}, |LFC| > {lfc_threshold})")
-    print(f"  [+] Significant unique IDs:      {len(sig_ids):<6} -> {sig_out_name}")
+    print(f"  Total clusters in CSV:               {total_rows}")
+    print(f"  Fixed Effect valid clusters:         {len(universe_df)}")
+    print(f"  [+] Universe unique IDs written:     {len(universe_ids):<6} -> {universe_out_name}")
+    print(f"  Fixed Effect significant clusters:   {len(sig_df)} (padj < {padj_threshold}, |LFC| > {lfc_threshold})")
+    print(f"  [+] Significant unique IDs:          {len(sig_ids):<6} -> {sig_out_name}")
+    print(f"  Fixed Effect upregulated clusters:   {len(up_df)} (padj < {padj_threshold}, LFC > {lfc_threshold})")
+    print(f"  [+] Upregulated unique IDs:          {len(up_ids):<6} -> {up_out_name}")
+    print(f"  Fixed Effect downregulated clusters: {len(down_df)} (padj < {padj_threshold}, LFC < -{lfc_threshold})")
+    print(f"  [+] Downregulated unique IDs:        {len(down_ids):<6} -> {down_out_name}")
 
     return True
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract Fixed Effect (FE) universe and significant gene lists from DESeq2 contrast results.",
+        description="Extract Fixed Effect (FE) universe, significant, upregulated, and downregulated gene lists from DESeq2 contrast results.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument(
@@ -166,6 +197,18 @@ def main():
         default="fe_significant.txt",
         help="Output filename for significant gene identifiers."
     )
+    parser.add_argument(
+        "--up-out",
+        type=str,
+        default="fe_upregulated.txt",
+        help="Output filename for upregulated gene identifiers."
+    )
+    parser.add_argument(
+        "--down-out",
+        type=str,
+        default="fe_downregulated.txt",
+        help="Output filename for downregulated gene identifiers."
+    )
 
     args = parser.parse_args()
 
@@ -194,6 +237,8 @@ def main():
     print(f"Found {len(target_dirs)} directory(ies) to process.")
     print(f"Criteria: FE Universe (Meta_FE_pval & Meta_FE_LFC not null)")
     print(f"          FE Significant (Meta_FE_padj < {args.padj} & |Meta_FE_LFC| > {args.lfc})")
+    print(f"          FE Upregulated (Meta_FE_padj < {args.padj} & Meta_FE_LFC > {args.lfc})")
+    print(f"          FE Downregulated (Meta_FE_padj < {args.padj} & Meta_FE_LFC < -{args.lfc})")
 
     success_count = 0
     for target_dir in target_dirs:
@@ -202,7 +247,9 @@ def main():
             padj_threshold=args.padj,
             lfc_threshold=args.lfc,
             universe_out_name=args.universe_out,
-            sig_out_name=args.sig_out
+            sig_out_name=args.sig_out,
+            up_out_name=args.up_out,
+            down_out_name=args.down_out
         )
         if success:
             success_count += 1
