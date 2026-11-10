@@ -37,7 +37,7 @@ cluster_significant_go_terms <- function(res_df, sig_padj = 0.05, sim_cutoff = 0
   do.call(rbind, out)
 }
 
-run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, cluster_annotation, comparison_gse_map, comparison_control_map = NULL, min_ds, out_dir, ora_padj = 0.05, ora_lfc = 1.0, exclude_evidence = c("ND"), min_gs_size = 5, max_gs_size = 500, directions = c("all", "up", "down"), sem_sim_cutoff = 0.7, report_padj = 0.05) {
+run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, cluster_annotation, comparison_gse_map, comparison_control_map = NULL, min_ds, out_dir, ora_padj = 0.05, ora_lfc = 1.0, exclude_evidence = c("ND"), min_gs_size = 5, max_gs_size = 500, directions = c("all", "up", "down"), sem_sim_cutoff = 0.7, report_padj = 0.05, operon_mapping_file = "operon_gene_mapping.csv", operon_de_threshold = 0.5) {
   cat("\n=== RUNNING OVER-REPRESENTATION META-ANALYSIS ===\n")
 
   # Validate directions
@@ -130,11 +130,91 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
     term2name <- unique(data.frame(term = goterms$go_id, name = goterms$Term, stringsAsFactors = FALSE))
     term2ontology <- unique(data.frame(term = goterms$go_id, ontology = goterms$Ontology, stringsAsFactors = FALSE))
 
+    # --- 2b. Operon Data Structure Setup (Option B: Measured Gene Universe) ---
+    operon_enabled <- FALSE
+    op_to_cids <- list()
+    cid_to_ops <- list()
+    op_labels <- character(0)
+    term_to_ops <- list()
+
+    if (!is.null(operon_mapping_file) && file.exists(operon_mapping_file)) {
+      cat("Loading Operon mapping file:", operon_mapping_file, "\n")
+      op_map <- tryCatch(
+        read.csv(operon_mapping_file, stringsAsFactors = FALSE),
+        error = function(e) {
+          cat("  ⚠ Failed to read operon mapping file:", e$message, "\n")
+          NULL
+        }
+      )
+      if (!is.null(op_map) && "final_cluster_id" %in% colnames(op_map) && "operon_id" %in% colnames(op_map)) {
+        valid_op <- op_map[op_map$final_cluster_id != "" & !is.na(op_map$final_cluster_id), ]
+        if (nrow(valid_op) > 0) {
+          operon_enabled <- TRUE
+          op_to_cids <- split(valid_op$final_cluster_id, valid_op$operon_id)
+          op_to_cids <- lapply(op_to_cids, unique)
+
+          cid_to_ops <- split(valid_op$operon_id, valid_op$final_cluster_id)
+          cid_to_ops <- lapply(cid_to_ops, unique)
+
+          u_op_ids <- unique(valid_op$operon_id)
+          for (oid in u_op_ids) {
+            sub_op <- valid_op[valid_op$operon_id == oid, ]
+            syms <- sub_op$gene_symbol[sub_op$gene_symbol != "" & !is.na(sub_op$gene_symbol)]
+            sym_str <- if (length(syms) > 0) paste(unique(syms), collapse = "/") else ""
+            op_labels[as.character(oid)] <- if (sym_str != "") paste0("Operon_", oid, " (", sym_str, ")") else paste0("Operon_", oid)
+          }
+        }
+      }
+    }
+
+    # Ensure every cluster in the study universe has an operon unit (singleton fallback)
+    if (operon_enabled) {
+      unassigned <- setdiff(all_genes, names(cid_to_ops))
+      if (length(unassigned) > 0) {
+        for (u_cid in unassigned) {
+          fake_id <- paste0("Singleton_", u_cid)
+          op_to_cids[[fake_id]] <- u_cid
+          cid_to_ops[[u_cid]] <- fake_id
+          op_labels[fake_id] <- fake_id
+        }
+      }
+
+      # Precompute mapping: GO term -> associated operon_ids
+      gene_to_terms <- split(term2gene$term, term2gene$gene)
+      cid_to_terms <- lapply(all_genes, function(cid) {
+        sym <- cluster_id_to_symbol[[cid]]
+        if (!is.na(sym) && sym != "" && sym %in% names(gene_to_terms)) {
+          unique(gene_to_terms[[sym]])
+        } else {
+          character(0)
+        }
+      })
+      names(cid_to_terms) <- all_genes
+
+      op_to_terms <- lapply(op_to_cids, function(cids) {
+        unique(unlist(cid_to_terms[intersect(cids, all_genes)]))
+      })
+
+      # Vectorized inversion to term_to_ops
+      op_names_vec <- rep(names(op_to_terms), lengths(op_to_terms))
+      term_vals_vec <- unlist(op_to_terms, use.names = FALSE)
+      if (length(term_vals_vec) > 0) {
+        term_to_ops <- split(op_names_vec, term_vals_vec)
+        term_to_ops <- lapply(term_to_ops, unique)
+      }
+      cat(sprintf("  ✓ Operon dual-ORA enabled: %d operon units across %d study clusters (Option B, threshold >= %.2f).\n",
+                  length(op_to_cids), length(all_genes), operon_de_threshold))
+    }
+
     ora_logor_list <- setNames(lapply(directions, function(x) list()), directions)
     ora_se_list <- setNames(lapply(directions, function(x) list()), directions)
     ora_comparisons <- setNames(lapply(directions, function(x) character(0)), directions)
     ora_gse_map <- setNames(lapply(directions, function(x) character(0)), directions)
     ora_contributing_genes <- setNames(lapply(directions, function(x) list()), directions)
+
+    ora_op_logor_list <- setNames(lapply(directions, function(x) list()), directions)
+    ora_op_se_list <- setNames(lapply(directions, function(x) list()), directions)
+    ora_contributing_operons <- setNames(lapply(directions, function(x) list()), directions)
 
     abs_ora_lfc <- abs(ora_lfc)
 
@@ -182,6 +262,18 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
       valid_terms_sub <- valid_terms[testable]
 
       de_counts_log <- list()
+      de_op_counts_log <- list()
+
+      if (operon_enabled) {
+        op_meas_counts <- sapply(op_to_cids, function(cids) sum(cids %in% universe_clusters))
+        valid_comp_ops <- names(op_to_cids)[op_meas_counts > 0]
+        total_bg_ops <- length(valid_comp_ops)
+
+        bg_op_num <- sapply(valid_terms_sub, function(t_id) {
+          t_ops <- term_to_ops[[t_id]]
+          if (is.null(t_ops)) 0L else sum(valid_comp_ops %in% t_ops)
+        })
+      }
 
       for (d in directions) {
         de_mask <- switch(d,
@@ -227,14 +319,79 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
         ora_se_list[[d]][[comp_name]] <- setNames(se_logOR, valid_terms_sub)
         ora_comparisons[[d]] <- c(ora_comparisons[[d]], comp_name)
         ora_gse_map[[d]][comp_name] <- gse_id
+
+        # --- Operon-Level ORA for this comparison (Option B: Measured Gene Universe) ---
+        if (operon_enabled && total_bg_ops > 0) {
+          op_de_counts <- sapply(valid_comp_ops, function(oid) {
+            cids <- op_to_cids[[oid]]
+            sum(cids %in% de_clusters)
+          })
+
+          # Option B: an operon is DE if >= operon_de_threshold (default 0.5) of measured member genes are DE
+          op_is_de <- (op_de_counts / op_meas_counts[valid_comp_ops]) >= operon_de_threshold
+          de_operons <- valid_comp_ops[op_is_de]
+          de_op_size <- length(de_operons)
+          de_op_counts_log[[d]] <- de_op_size
+
+          if (de_op_size > 0) {
+            a_op <- sapply(valid_terms_sub, function(t_id) {
+              t_ops <- term_to_ops[[t_id]]
+              if (is.null(t_ops)) 0L else sum(de_operons %in% t_ops)
+            })
+            b_op <- de_op_size - a_op
+            c_op <- bg_op_num - a_op
+            d_op <- total_bg_ops - de_op_size - c_op
+
+            a_op_adj <- a_op + 0.5
+            b_op_adj <- b_op + 0.5
+            c_op_adj <- c_op + 0.5
+            d_op_adj <- d_op + 0.5
+
+            logor_op <- log((a_op_adj * d_op_adj) / (b_op_adj * c_op_adj))
+            se_op <- sqrt(1 / a_op_adj + 1 / b_op_adj + 1 / c_op_adj + 1 / d_op_adj)
+
+            ora_op_logor_list[[d]][[comp_name]] <- setNames(logor_op, valid_terms_sub)
+            ora_op_se_list[[d]][[comp_name]] <- setNames(se_op, valid_terms_sub)
+
+            # Record contributing DE operons
+            hit_terms <- valid_terms_sub[a_op > 0]
+            if (length(hit_terms) > 0) {
+              comp_op_overlaps_list <- lapply(hit_terms, function(t_id) {
+                t_ops <- term_to_ops[[t_id]]
+                hit_ops <- intersect(de_operons, t_ops)
+                if (length(hit_ops) > 0) {
+                  data.frame(
+                    term = t_id,
+                    operon_id = hit_ops,
+                    operon_label = unname(op_labels[hit_ops]),
+                    comparison = comp_name,
+                    gse = gse_id,
+                    stringsAsFactors = FALSE
+                  )
+                } else {
+                  NULL
+                }
+              })
+              comp_op_overlaps <- do.call(rbind, comp_op_overlaps_list)
+              if (!is.null(comp_op_overlaps) && nrow(comp_op_overlaps) > 0) {
+                ora_contributing_operons[[d]][[comp_name]] <- comp_op_overlaps
+              }
+            }
+          }
+        }
       }
 
       cat(sprintf(
-        "  [%s] Eligible genes: %d | Mapped universe genes: %d | Mapped DE genes (all: %s, up: %s, down: %s)\n",
+        "  [%s] Eligible genes: %d | Mapped universe genes: %d | Mapped DE genes (all: %s, up: %s, down: %s)%s\n",
         comp_name, length(universe_clusters), length(universe_symbols),
         if (!is.null(de_counts_log[["all"]])) as.character(de_counts_log[["all"]]) else "-",
         if (!is.null(de_counts_log[["up"]])) as.character(de_counts_log[["up"]]) else "-",
-        if (!is.null(de_counts_log[["down"]])) as.character(de_counts_log[["down"]]) else "-"
+        if (!is.null(de_counts_log[["down"]])) as.character(de_counts_log[["down"]]) else "-",
+        if (operon_enabled) sprintf(" | Mapped DE operons (all: %s, up: %s, down: %s)",
+          if (!is.null(de_op_counts_log[["all"]])) as.character(de_op_counts_log[["all"]]) else "-",
+          if (!is.null(de_op_counts_log[["up"]])) as.character(de_op_counts_log[["up"]]) else "-",
+          if (!is.null(de_op_counts_log[["down"]])) as.character(de_op_counts_log[["down"]]) else "-"
+        ) else ""
       ))
     }
 
@@ -269,6 +426,18 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
         list()
       }
 
+      # Pre-aggregate all contributing DE operon overlaps for direction d
+      all_op_overlaps_d <- if (operon_enabled && length(ora_contributing_operons[[d]]) > 0) {
+        do.call(rbind, ora_contributing_operons[[d]])
+      } else {
+        NULL
+      }
+      op_overlaps_by_term <- if (!is.null(all_op_overlaps_d) && nrow(all_op_overlaps_d) > 0) {
+        split(all_op_overlaps_d, all_op_overlaps_d$term)
+      } else {
+        list()
+      }
+
       all_go_ids <- unique(unlist(lapply(curr_logor_list, names)))
 
       ora_yi <- matrix(NA, nrow = length(all_go_ids), ncol = length(curr_logor_list), dimnames = list(all_go_ids, curr_comparisons))
@@ -279,7 +448,24 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
         ora_vi[names(curr_se_list[[comp_name]]), comp_name] <- curr_se_list[[comp_name]]^2
       }
 
-      cat(sprintf("  Meta-analyzing %d GO terms across %d comparisons (direction: %s)...\n",
+      # Matrices for operon-level meta-analysis
+      curr_op_logor_list <- ora_op_logor_list[[d]]
+      curr_op_se_list <- ora_op_se_list[[d]]
+      has_operon_data <- operon_enabled && length(curr_op_logor_list) > 0
+
+      ora_op_yi <- matrix(NA, nrow = length(all_go_ids), ncol = length(curr_comparisons), dimnames = list(all_go_ids, curr_comparisons))
+      ora_op_vi <- matrix(NA, nrow = length(all_go_ids), ncol = length(curr_comparisons), dimnames = list(all_go_ids, curr_comparisons))
+
+      if (has_operon_data) {
+        for (comp_name in names(curr_op_logor_list)) {
+          if (comp_name %in% curr_comparisons) {
+            ora_op_yi[names(curr_op_logor_list[[comp_name]]), comp_name] <- curr_op_logor_list[[comp_name]]
+            ora_op_vi[names(curr_op_se_list[[comp_name]]), comp_name] <- curr_op_se_list[[comp_name]]^2
+          }
+        }
+      }
+
+      cat(sprintf("  Meta-analyzing %d GO terms across %d comparisons (direction: %s, dual gene+operon)...\n",
                   length(all_go_ids), length(curr_comparisons), d))
 
       ora_meta_res <- list()
@@ -288,7 +474,7 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
         yi_go <- ora_yi[i, ]
         vi_go <- ora_vi[i, ]
 
-        # --- 6. Meta-Analyze Each GO Term ---
+        # --- 6. Meta-Analyze Each GO Term (Gene Level) ---
         # Fit 3-Level Random Effects (w/ clubSandwich RVE) and Fixed Effects models
         valid_go <- !is.na(yi_go) & !is.na(vi_go)
         valid_gse_go <- curr_gse_map[valid_go]
@@ -346,7 +532,7 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
             debug_printed <- TRUE
           }
 
-          # LogOR Meta-Analysis
+          # Gene-Level LogOR Meta-Analysis
           res_re <- tryCatch(
             metafor::rma.mv(yi = yi_go[valid_go], V = V_mat_logor, random = ~ 1 | valid_gse_go / valid_comp_go, method = "REML"),
             error = function(e) {
@@ -376,6 +562,82 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
             }
           )
 
+          # --- 6b. Operon-Level Meta-Analysis (Option B) ---
+          op_re_est <- NA_real_
+          op_re_se  <- NA_real_
+          op_re_p   <- NA_real_
+          op_fe_est <- NA_real_
+          op_fe_se  <- NA_real_
+          op_fe_p   <- NA_real_
+
+          if (has_operon_data && go_id %in% rownames(ora_op_yi)) {
+            yi_op <- ora_op_yi[go_id, ]
+            vi_op <- ora_op_vi[go_id, ]
+            valid_op <- !is.na(yi_op) & !is.na(vi_op)
+
+            if (sum(valid_op) >= 2) {
+              valid_gse_op <- curr_gse_map[valid_op]
+              valid_comp_op <- curr_comparisons[valid_op]
+
+              if (!is.null(comparison_control_map)) {
+                valid_control_op <- comparison_control_map[valid_comp_op]
+                valid_cov_cluster_op <- paste0(valid_gse_op, "_", ifelse(is.na(valid_control_op), "UnknownControl", valid_control_op))
+              } else {
+                valid_cov_cluster_op <- valid_gse_op
+              }
+
+              V_mat_op <- tryCatch(
+                metafor::vcalc(vi = vi_op[valid_op], cluster = valid_cov_cluster_op, obs = 1:sum(valid_op), rho = 0.5),
+                error = function(e) vi_op[valid_op]
+              )
+
+              res_re_op <- tryCatch(
+                metafor::rma.mv(yi = yi_op[valid_op], V = V_mat_op, random = ~ 1 | valid_gse_op / valid_comp_op, method = "REML"),
+                error = function(e) NULL
+              )
+              if (!is.null(res_re_op)) {
+                res_re_op_rob <- tryCatch(
+                  metafor::robust(res_re_op, cluster = valid_gse_op, clubSandwich = TRUE),
+                  error = function(e) NULL
+                )
+                if (!is.null(res_re_op_rob)) res_re_op <- res_re_op_rob
+              }
+
+              res_fe_op <- tryCatch(
+                metafor::rma.mv(yi = yi_op[valid_op], V = V_mat_op),
+                error = function(e) NULL
+              )
+
+              op_re_est <- if (!is.null(res_re_op)) as.numeric(res_re_op$beta)[1] else NA_real_
+              op_re_se  <- if (!is.null(res_re_op)) as.numeric(res_re_op$se)[1] else NA_real_
+              op_re_p   <- if (!is.null(res_re_op)) one_sided_p(op_re_est, as.numeric(res_re_op$pval)[1]) else NA_real_
+
+              op_fe_est <- if (!is.null(res_fe_op)) as.numeric(res_fe_op$beta)[1] else NA_real_
+              op_fe_se  <- if (!is.null(res_fe_op)) as.numeric(res_fe_op$se)[1] else NA_real_
+              op_fe_p   <- if (!is.null(res_fe_op)) one_sided_p(op_fe_est, as.numeric(res_fe_op$pval)[1]) else NA_real_
+            }
+          }
+
+          # Extract contributing operons for this GO term across valid comparisons
+          term_op_sub <- op_overlaps_by_term[[go_id]]
+          if (!is.null(term_op_sub) && nrow(term_op_sub) > 0) {
+            term_op_sub <- term_op_sub[term_op_sub$comparison %in% valid_comp_go, , drop = FALSE]
+          }
+
+          if (!is.null(term_op_sub) && nrow(term_op_sub) > 0) {
+            op_comp_counts <- tapply(term_op_sub$comparison, term_op_sub$operon_label, function(x) length(unique(x)))
+            sorted_ops <- names(op_comp_counts)[order(-op_comp_counts, names(op_comp_counts))]
+            sorted_op_counts <- as.integer(op_comp_counts[sorted_ops])
+
+            term_op_count <- length(sorted_ops)
+            term_ops <- paste(sorted_ops, collapse = "; ")
+            term_ops_freq <- paste(sprintf("%s (%d/%d)", sorted_ops, sorted_op_counts, n_valid_comps), collapse = "; ")
+          } else {
+            term_op_count <- 0L
+            term_ops <- ""
+            term_ops_freq <- ""
+          }
+
           if (!is.null(res_re) || !is.null(res_fe)) {
             re_est <- if (!is.null(res_re)) as.numeric(res_re$beta)[1] else NA_real_
             re_se  <- if (!is.null(res_re)) as.numeric(res_re$se)[1] else NA_real_
@@ -385,24 +647,43 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
             fe_se  <- if (!is.null(res_fe)) as.numeric(res_fe$se)[1] else NA_real_
             fe_p   <- if (!is.null(res_fe)) one_sided_p(fe_est, as.numeric(res_fe$pval)[1]) else NA_real_
 
-            ora_meta_res[[go_id]] <- data.frame(
+            row_data <- data.frame(
               ID = go_id,
               Ontology = term2ontology$ontology[match(go_id, term2ontology$term)],
               Description = term2name$name[match(go_id, term2name$term)],
               Direction = d,
+              # Gene-Level Metrics
               logOR_RE_estimate = re_est,
               logOR_RE_SE = re_se,
               logOR_RE_pval = re_p,
               logOR_FE_estimate = fe_est,
               logOR_FE_SE = fe_se,
               logOR_FE_pval = fe_p,
-              N_comparisons = n_valid_comps,
-              N_datasets = length(unique(valid_gse_go)),
-              Gene_Count = term_gene_count,
-              Genes = term_genes,
-              Genes_Frequency = term_genes_freq,
               stringsAsFactors = FALSE
             )
+
+            if (has_operon_data) {
+              row_data$Operon_logOR_RE_estimate <- op_re_est
+              row_data$Operon_logOR_RE_SE <- op_re_se
+              row_data$Operon_logOR_RE_pval <- op_re_p
+              row_data$Operon_logOR_FE_estimate <- op_fe_est
+              row_data$Operon_logOR_FE_SE <- op_fe_se
+              row_data$Operon_logOR_FE_pval <- op_fe_p
+            }
+
+            row_data$N_comparisons <- n_valid_comps
+            row_data$N_datasets <- length(unique(valid_gse_go))
+            row_data$Gene_Count <- term_gene_count
+            row_data$Genes <- term_genes
+            row_data$Genes_Frequency <- term_genes_freq
+
+            if (has_operon_data) {
+              row_data$Operon_Count <- term_op_count
+              row_data$Operons <- term_ops
+              row_data$Operons_Frequency <- term_ops_freq
+            }
+
+            ora_meta_res[[go_id]] <- row_data
           }
         }
       }
@@ -416,14 +697,48 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
         ora_meta_df$logOR_RE_padj <- p.adjust(ora_meta_df$logOR_RE_pval, method = "BH")
         ora_meta_df$logOR_FE_padj <- p.adjust(ora_meta_df$logOR_FE_pval, method = "BH")
 
-        # Reorder columns to put padj next to pval, followed by gene info
-        ora_meta_df <- ora_meta_df[, c(
+        if (has_operon_data) {
+          ora_meta_df$Operon_logOR_RE_padj <- p.adjust(ora_meta_df$Operon_logOR_RE_pval, method = "BH")
+          ora_meta_df$Operon_logOR_FE_padj <- p.adjust(ora_meta_df$Operon_logOR_FE_pval, method = "BH")
+
+          # Classification / Inflation Flag
+          gene_sig <- !is.na(ora_meta_df$logOR_RE_padj) & ora_meta_df$logOR_RE_padj < report_padj & !is.na(ora_meta_df$logOR_RE_estimate) & ora_meta_df$logOR_RE_estimate > 0
+          op_sig   <- !is.na(ora_meta_df$Operon_logOR_RE_padj) & ora_meta_df$Operon_logOR_RE_padj < report_padj & !is.na(ora_meta_df$Operon_logOR_RE_estimate) & ora_meta_df$Operon_logOR_RE_estimate > 0
+
+          ora_meta_df$Operon_Inflation_Flag <- ifelse(
+            gene_sig & op_sig,
+            "Robust (Gene+Operon Confirmed)",
+            ifelse(
+              gene_sig & !op_sig,
+              ifelse(ora_meta_df$Operon_Count <= 2, "Operon-Driven Inflation (Single/Few Operon)", "Operon-Attenuated (Broadly Dispersed)"),
+              ifelse(!gene_sig & op_sig, "Operon-Emergent", "Not Significant")
+            )
+          )
+        }
+
+        # Reorder columns to put padj next to pval, followed by operon metrics, counts, and gene/operon info
+        out_cols <- c(
           "ID", "Ontology", "Description", "Direction",
           "logOR_RE_estimate", "logOR_RE_SE", "logOR_RE_pval", "logOR_RE_padj",
-          "logOR_FE_estimate", "logOR_FE_SE", "logOR_FE_pval", "logOR_FE_padj",
+          "logOR_FE_estimate", "logOR_FE_SE", "logOR_FE_pval", "logOR_FE_padj"
+        )
+        if (has_operon_data) {
+          out_cols <- c(out_cols,
+            "Operon_logOR_RE_estimate", "Operon_logOR_RE_SE", "Operon_logOR_RE_pval", "Operon_logOR_RE_padj",
+            "Operon_logOR_FE_estimate", "Operon_logOR_FE_SE", "Operon_logOR_FE_pval", "Operon_logOR_FE_padj",
+            "Operon_Inflation_Flag"
+          )
+        }
+        out_cols <- c(out_cols,
           "N_comparisons", "N_datasets",
           "Gene_Count", "Genes", "Genes_Frequency"
-        )]
+        )
+        if (has_operon_data) {
+          out_cols <- c(out_cols,
+            "Operon_Count", "Operons", "Operons_Frequency"
+          )
+        }
+        ora_meta_df <- ora_meta_df[, out_cols]
 
         ora_meta_df <- ora_meta_df[order(ora_meta_df$logOR_RE_pval, na.last = TRUE), ]
 
@@ -527,6 +842,97 @@ run_ora_meta_analysis <- function(gaf_file, lfc_list, pval_list, se_list, cts, c
                 cat(sprintf("  - Saved Gene-Level Summary (legacy default) to %s\n", gene_sum_file_legacy))
               }
               summary_by_dir[[d]] <- gene_summary_df
+            }
+          }
+        }
+
+        # --- 7c. Export Detailed Operon Contributions and Operon Summaries ---
+        if (has_operon_data && !is.null(all_op_overlaps_d) && nrow(all_op_overlaps_d) > 0) {
+          op_overlaps_tested <- all_op_overlaps_d[all_op_overlaps_d$term %in% ora_meta_df$ID, , drop = FALSE]
+
+          if (nrow(op_overlaps_tested) > 0) {
+            term_valid_n <- setNames(ora_meta_df$N_comparisons, ora_meta_df$ID)
+            to_key <- paste(op_overlaps_tested$term, op_overlaps_tested$operon_id, sep = "@@@")
+            to_splits <- split(op_overlaps_tested, to_key)
+
+            op_contrib_rows <- lapply(to_splits, function(df_to) {
+              t_id <- df_to$term[1]
+              op_id <- df_to$operon_id[1]
+              op_lbl <- df_to$operon_label[1]
+              comps <- unique(df_to$comparison)
+              gses  <- unique(df_to$gse)
+              n_comps <- length(comps)
+              tot_comps <- if (!is.na(term_valid_n[t_id])) term_valid_n[t_id] else length(curr_comparisons)
+              pct_comps <- round(100 * n_comps / tot_comps, 1)
+
+              data.frame(
+                GO_ID = t_id,
+                Ontology = term2ontology$ontology[match(t_id, term2ontology$term)],
+                Description = term2name$name[match(t_id, term2name$term)],
+                Direction = d,
+                Operon_ID = op_id,
+                Operon_Label = op_lbl,
+                N_Comparisons = n_comps,
+                Total_Comparisons = tot_comps,
+                Percent_Comparisons = pct_comps,
+                N_Datasets = length(gses),
+                Comparisons = paste(sort(comps), collapse = "; "),
+                Datasets = paste(sort(gses), collapse = "; "),
+                stringsAsFactors = FALSE
+              )
+            })
+            op_contrib_df <- do.call(rbind, op_contrib_rows)
+            op_contrib_df <- op_contrib_df[order(op_contrib_df$GO_ID, -op_contrib_df$N_Comparisons, op_contrib_df$Operon_ID), ]
+
+            op_contrib_file_d <- file.path(out_dir, sprintf("ORA_Meta_Analysis_Operon_Contributions_%s.csv", d))
+            write.csv(op_contrib_df, op_contrib_file_d, row.names = FALSE)
+            cat(sprintf("  - Saved Detailed Operon Contributions (%s) to %s\n", d, op_contrib_file_d))
+
+            if (d == "all") {
+              op_contrib_file_legacy <- file.path(out_dir, "ORA_Meta_Analysis_Operon_Contributions.csv")
+              write.csv(op_contrib_df, op_contrib_file_legacy, row.names = FALSE)
+              cat(sprintf("  - Saved Detailed Operon Contributions (legacy default) to %s\n", op_contrib_file_legacy))
+            }
+
+            # Export operon-level summary across significant terms (padj < report_padj)
+            sig_op_term_ids <- ora_meta_df$ID[!is.na(ora_meta_df$Operon_logOR_RE_padj) & ora_meta_df$Operon_logOR_RE_padj < report_padj]
+            sig_op_overlaps <- op_overlaps_tested[op_overlaps_tested$term %in% sig_op_term_ids, , drop = FALSE]
+
+            if (nrow(sig_op_overlaps) > 0) {
+              op_splits <- split(sig_op_overlaps, sig_op_overlaps$operon_id)
+              op_summary_rows <- lapply(op_splits, function(df_o) {
+                op_id <- df_o$operon_id[1]
+                op_lbl <- df_o$operon_label[1]
+                terms <- unique(df_o$term)
+                term_names <- term2name$name[match(terms, term2name$term)]
+                term_desc <- sprintf("%s (%s)", terms, term_names)
+                comps <- unique(df_o$comparison)
+                gses <- unique(df_o$gse)
+                data.frame(
+                  Operon_ID = op_id,
+                  Operon_Label = op_lbl,
+                  Direction = d,
+                  N_Significant_Terms = length(terms),
+                  N_Comparisons = length(comps),
+                  N_Datasets = length(gses),
+                  Significant_Terms = paste(term_desc, collapse = "; "),
+                  Comparisons = paste(sort(comps), collapse = "; "),
+                  Datasets = paste(sort(gses), collapse = "; "),
+                  stringsAsFactors = FALSE
+                )
+              })
+              op_summary_df <- do.call(rbind, op_summary_rows)
+              op_summary_df <- op_summary_df[order(-op_summary_df$N_Significant_Terms, -op_summary_df$N_Comparisons, op_summary_df$Operon_ID), ]
+
+              op_sum_file_d <- file.path(out_dir, sprintf("ORA_Meta_Analysis_Operon_Summary_%s.csv", d))
+              write.csv(op_summary_df, op_sum_file_d, row.names = FALSE)
+              cat(sprintf("  - Saved Operon-Level Summary across significant terms (%s) to %s\n", d, op_sum_file_d))
+
+              if (d == "all") {
+                op_sum_file_legacy <- file.path(out_dir, "ORA_Meta_Analysis_Operon_Summary.csv")
+                write.csv(op_summary_df, op_sum_file_legacy, row.names = FALSE)
+                cat(sprintf("  - Saved Operon-Level Summary (legacy default) to %s\n", op_sum_file_legacy))
+              }
             }
           }
         }
