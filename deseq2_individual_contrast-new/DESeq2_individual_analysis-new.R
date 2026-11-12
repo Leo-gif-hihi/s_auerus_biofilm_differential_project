@@ -72,6 +72,18 @@ option_list <- list(
     type = "character", default = "QuickGO-annotations-1764241851574-20251127.gaf",
     help = "Path to GAF file for GO annotations [default= %default]", metavar = "character"
   ),
+  make_option(c("--skip_kegg"),
+    action = "store_true", default = FALSE,
+    help = "Skip KEGG pathway ORA meta-analysis and FE-ORA [default= %default]"
+  ),
+  make_option(c("--kegg_cache"),
+    type = "character", default = "kegg_sao_cache.rds",
+    help = "Path to cached KEGG sao annotations (.rds) [default= %default]", metavar = "character"
+  ),
+  make_option(c("--refresh_kegg"),
+    action = "store_true", default = FALSE,
+    help = "Force re-download of KEGG sao annotations instead of using cache [default= %default]"
+  ),
   make_option(c("--skip_concordance"),
     action = "store_true", default = FALSE,
     help = "Skip gene-pair concordance meta-analysis [default= %default]"
@@ -1689,6 +1701,50 @@ if (run_dropout_flag) {
     ora_lfc = opt$ora_lfc,
     meta_results_by_dir = meta_ora_results
   )
+
+  # --- KEGG Pathway ORA Meta-Analysis & FE-ORA ---
+  if (!isTRUE(opt$skip_kegg)) {
+    kegg_meta_results <- tryCatch(
+      run_kegg_meta_analysis(
+        lfc_list = lfc_list,
+        pval_list = pval_list,
+        se_list = se_list,
+        cts = cts,
+        cluster_annotation = cluster_annotation,
+        comparison_gse_map = comparison_gse_map,
+        comparison_control_map = comparison_control_map,
+        min_ds = min_ds,
+        out_dir = out_dir,
+        ora_padj = opt$ora_padj,
+        ora_lfc = opt$ora_lfc,
+        kegg_cache_file = opt$kegg_cache,
+        refresh_kegg = opt$refresh_kegg
+      ),
+      error = function(e) {
+        cat("  ⚠ Warning: KEGG Meta-ORA failed:", e$message, "\n")
+        NULL
+      }
+    )
+
+    tryCatch(
+      run_fe_kegg_ora(
+        res_df = res_df_export,
+        cluster_annotation = cluster_annotation,
+        out_dir = out_dir,
+        ora_padj = opt$ora_padj,
+        ora_lfc = opt$ora_lfc,
+        kegg_cache_file = opt$kegg_cache,
+        refresh_kegg = opt$refresh_kegg,
+        meta_results_by_dir = kegg_meta_results
+      ),
+      error = function(e) {
+        cat("  ⚠ Warning: KEGG FE-ORA failed:", e$message, "\n")
+        NULL
+      }
+    )
+  } else {
+    cat("\nSkipping KEGG ORA analysis (--skip_kegg enabled).\n")
+  }
 
   # --- iModulon / decoupleR Regulatory Meta-Analysis ---
   if (file.exists("imodulon_decoupler_analysis.R")) {
