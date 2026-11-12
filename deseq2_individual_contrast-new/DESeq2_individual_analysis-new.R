@@ -112,6 +112,10 @@ option_list <- list(
     action = "store_true", default = FALSE,
     help = "Force re-running all drop-out combinations even if cached results exist [default= %default]"
   ),
+  make_option(c("--imodulon_min_targets"),
+    type = "integer", default = 5,
+    help = "Minimum target genes per iModulon to evaluate [default= %default]", metavar = "integer"
+  ),
   make_option(c("-c", "--cores"),
     type = "integer", default = min(12, max(1, parallel::detectCores() - 4)),
     help = "Number of CPU cores for parallel processing (default leaves 4 cores free for laptop daily tasks) [default= %default]", metavar = "integer"
@@ -169,6 +173,7 @@ install_if_needed("metafor")
 install_if_needed("clubSandwich")
 install_if_needed("EmpiricalBrownsMethod", bioc = TRUE)
 install_if_needed("glmmTMB")
+install_if_needed("decoupleR", bioc = TRUE)
 
 library(DESeq2)
 library(limma)
@@ -1684,6 +1689,28 @@ if (run_dropout_flag) {
     ora_lfc = opt$ora_lfc,
     meta_results_by_dir = meta_ora_results
   )
+
+  # --- iModulon / decoupleR Regulatory Meta-Analysis ---
+  if (file.exists("imodulon_decoupler_analysis.R")) {
+    source("imodulon_decoupler_analysis.R")
+    imodulon_results <- run_imodulon_analysis(
+      res_df = res_df_export,
+      lfc_list = lfc_list,
+      se_list = se_list,
+      comparison_gse_map = comparison_gse_map,
+      comparison_control_map = comparison_control_map,
+      neff_list = neff_list,
+      min_ds = min_ds,
+      sample_label = sample_dir_name,
+      gaf_file = opt$gaf_file,
+      out_dir = out_dir,
+      vis_dir = vis_dir,
+      min_targets = opt$imodulon_min_targets,
+      run_consensus = TRUE
+    )
+  } else {
+    cat("  ⚠ Warning: imodulon_decoupler_analysis.R not found. Skipping iModulon analysis.\n")
+  }
 
   # --- Gene-Pair Concordance Meta-Analysis ---
   if (!isTRUE(opt$skip_concordance)) {
