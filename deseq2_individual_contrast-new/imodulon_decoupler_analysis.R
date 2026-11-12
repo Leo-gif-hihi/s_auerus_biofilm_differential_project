@@ -75,7 +75,7 @@ if (!exists("map_clusters_to_imodulon") && file.exists("gene_id_mapping.R")) {
     mutate(cutoff = unname(thr_map[source])) %>%
     filter(abs(weight) >= cutoff) %>%
     mutate(mor = weight) %>%
-    select(source, target, mor)
+    dplyr::select(source, target, mor)
 
   clean_table <- clean_table %>%
     mutate(
@@ -486,7 +486,7 @@ if (!exists("map_clusters_to_imodulon") && file.exists("gene_id_mapping.R")) {
     group_by(condition, statistic) %>%
     mutate(padj = p.adjust(p_value, method = "BH")) %>%
     ungroup() %>%
-    left_join(imod_meta %>% select(source, imodulon_name, category, regulator), by = "source")
+    left_join(imod_meta %>% dplyr::select(source, imodulon_name, category, regulator), by = "source")
 
   per_csv <- file.path(out_dir, "iModulon_PerDataset_Activities.csv")
   write.csv(all_per_df, per_csv, row.names = FALSE)
@@ -659,7 +659,7 @@ if (!exists("map_clusters_to_imodulon") && file.exists("gene_id_mapping.R")) {
   if (is.null(meta_df) || length(direct_results) == 0) return(invisible(NULL))
 
   cmp <- meta_df %>%
-    select(
+    dplyr::select(
       source, imodulon_name, category, regulator,
       n_comparisons, n_datasets,
       MetaULM_3LRE_FisherZ = ULM_3LRE_FisherZ, MetaULM_3LRE_pval = ULM_3LRE_pval, MetaULM_3LRE_padj = ULM_3LRE_padj,
@@ -671,7 +671,7 @@ if (!exists("map_clusters_to_imodulon") && file.exists("gene_id_mapping.R")) {
     for (st in stats_to_merge) {
       d_sub <- direct_results[[m_lbl]] %>%
         filter(statistic == st) %>%
-        select(source, score, p_value, padj)
+        dplyr::select(source, score, p_value, padj)
       st_tag <- toupper(st)
       colnames(d_sub)[2:4] <- paste0("Direct_", m_lbl, "_", st_tag, c("_score", "_pval", "_padj"))
       cmp <- left_join(cmp, d_sub, by = "source")
@@ -761,7 +761,7 @@ run_imodulon_analysis <- function(res_df,
 
   # 2. Harmonize cluster_ids <-> M-matrix targets & report mapping %
   if (!"cluster_id" %in% colnames(res_df)) res_df$cluster_id <- rownames(res_df)
-  cluster_df <- res_df %>% select(any_of(c("cluster_id", "Representative_Gene", "All_Genes_Locus_Tags")))
+  cluster_df <- res_df %>% dplyr::select(any_of(c("cluster_id", "Representative_Gene", "All_Genes_Locus_Tags")))
   mapped <- .build_mapped_network(
     net_raw = curated$net_raw,
     cluster_df = cluster_df,

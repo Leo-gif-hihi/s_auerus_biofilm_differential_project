@@ -37,20 +37,20 @@ cluster_significant_go_terms <- function(res_df, sig_padj = 0.05, sim_cutoff = 0
   do.call(rbind, out)
 }
 
-# Ensure required Bioconductor and CRAN packages are installed and loaded.
+# Ensure required Bioconductor and CRAN packages are installed without polluting the search path.
 .ensure_ora_packages <- function(bioc_pkgs = character(0), cran_pkgs = character(0)) {
   for (pkg in bioc_pkgs) {
     if (!requireNamespace(pkg, quietly = TRUE)) {
       if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager", repos = "https://cloud.r-project.org")
       BiocManager::install(pkg, update = FALSE, ask = FALSE)
+      requireNamespace(pkg, quietly = TRUE)
     }
-    suppressPackageStartupMessages(library(pkg, character.only = TRUE))
   }
   for (pkg in cran_pkgs) {
     if (!requireNamespace(pkg, quietly = TRUE)) {
       install.packages(pkg, repos = "https://cloud.r-project.org", quiet = TRUE)
+      requireNamespace(pkg, quietly = TRUE)
     }
-    suppressPackageStartupMessages(library(pkg, character.only = TRUE))
   }
 }
 
